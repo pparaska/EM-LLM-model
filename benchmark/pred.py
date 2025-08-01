@@ -42,7 +42,7 @@ def parse_args():
     parser.add_argument("--datasets", type=str, default=None)
     parser.add_argument("--rank", type=int, default=None)
     parser.add_argument("--world_size", type=int, default=None)
-    parser.add_argument("--datetime", default=datetime.now().strftime('%Y-%m-%d %H:%M'))
+    parser.add_argument("--datetime", default=datetime.now().strftime('%Y-%m-%d_%H-%M'))
 
     parser.add_argument("--allow_disk_offload", type=str2bool, default=False)
 
@@ -563,8 +563,15 @@ def main(args):
     datasets = args.datasets
     
     # we design specific prompt format and max generation length for each task, feel free to modify them to optimize model output
-    dataset2prompt = json.load(open("benchmark/config/dataset2prompt.json", "r"))
-    dataset2maxlen = json.load(open("benchmark/config/dataset2maxlen.json", "r"))
+    with open("benchmark/config/dataset2prompt.json", "r", encoding="utf-8") as f:
+        dataset2prompt = json.load(f)
+
+    with open("benchmark/config/dataset2maxlen.json", "r", encoding="utf-8") as f:
+        dataset2maxlen = json.load(f)
+
+
+    #dataset2prompt = json.load(open("benchmark/config/dataset2prompt.json", "r"))
+    #dataset2maxlen = json.load(open("benchmark/config/dataset2maxlen.json", "r"))
 
     multiprocessing = args.world_size is not None and args.world_size > 1
     if multiprocessing:

@@ -23,6 +23,7 @@ base_url="https://huggingface.co/datasets/xinrongzhang2022/InfiniteBench/resolve
 # Download files if they don't already exist
 for file in "${files[@]}"; do
     if [ ! -f "$file" ]; then
-        wget "${base_url}/${file}" --no-check-certificate
+        #wget "${base_url}/${file}" --no-check-certificate
+        C://Users//infolab01//Downloads//Master_Thesis_Poonam//EM-LLM-model//wget.exe "${base_url}/${file}" --no-check-certificate
     fi
 done

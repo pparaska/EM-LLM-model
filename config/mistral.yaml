@@ -4,30 +4,29 @@ return_block_size: true
 logging: true
 em_splitter: surprisal
 
-max_len: 2147483647
-chunk_size: 512
+max_len: 8192        # 🔻 Lowered max_len from ~2B to 32K (realistic for long context)
+chunk_size: 128       # 🔻 Reduces memory during generation
 conv_type: mistral-inst
-
 extended_passkey: 1024
 
 model:
   type: em-llm
   path: mistralai/Mistral-7B-Instruct-v0.2
   min_block_size: 8
-  max_block_size: 128
-  n_init: 128
-  n_local: 4096
-  n_mem: 2048
+  max_block_size: 32          # 🔻 Reduce to lessen attention buffer
+  n_init: 64                  # 🔻 Lower initialization size
+  n_local: 1024               # 🔻 Halve local memory to reduce usage
+  n_mem: 512                 # 🔻 Halve retained memory
   repr_topk: 4
-  max_cached_block: 512  # must be greater than n_mem/min_block_size
-  exc_block_size: 512
+  max_cached_block: 128       # 🔻 Reduce from 512
+  exc_block_size: 128         # 🔻 Match to above
   base: 1000000
   distance_scale: 1.0
   surprisal_threshold_gamma: 1.0
 
-  min_free_cpu_memory: 100
-  disk_offload_threshold: 300000
-  vector_offload_threshold: 50000
+  min_free_cpu_memory: 50
+  disk_offload_threshold: 50000     # 🔻 Lower threshold for safer offload
+  vector_offload_threshold: 5000    # 🔻 More aggressive offload
 
   similarity_refinement_kwargs:
     similarity_refinement: false
