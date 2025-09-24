@@ -35,7 +35,7 @@ done
 
 # Check dataset
 if [ -z "$dataset" ]; then
-    echo "❌ Please provide a dataset with --dataset <name> (e.g., --dataset 2wikimqa)"
+    echo "Please provide a dataset with --dataset <name> (e.g., --dataset 2wikimqa)"
     exit 1
 fi
 
@@ -68,13 +68,13 @@ CUDA_VISIBLE_DEVICES=0 python "${base_dir}/benchmark/pred.py" \
     --rank "0" \
     --allow_disk_offload "${allow_disk_offload}"
 
-echo "✅ Completed: $dataset"
+echo "Completed: $dataset"
 
 # Clean up GPU/disk cache to avoid OOM
 DIRECTORY="${output_dir_path}/offload_data"
 if [ -d "$DIRECTORY" ]; then
     rm -rf "$DIRECTORY"
-    echo "🧹 Deleted offload data directory: $DIRECTORY"
+    echo "Deleted offload data directory: $DIRECTORY"
 fi
 
 # Optional: Evaluate
