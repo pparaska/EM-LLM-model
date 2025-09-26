@@ -1,0 +1,8 @@
+bash scripts/run.sh -m mistral -b long-bench -d 2wikimqa -o True
+bash scripts/run.sh -m mistral -b long-bench -d gov_report -o True
+
+bash scripts/run.sh -m mistral -b infinite-bench -d math_find -o True
+
+bash scripts/run.sh -m mistral -b long-bench -d hotpotqa -o True
+
+
