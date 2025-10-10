@@ -134,13 +134,4 @@ contiguity_buffer_size: 0.3
 surprisal_threshold_gamma: 1.0
 ```
 
-**Expected Results**:
-```
-Config                    | Expected Score | Runtime
---------------------------|----------------|----------
-Current (S only)          | 48-49          | Baseline
-+ Modularity (SM)         | 50-51          | +30%
-+ Contiguity (SM+C)       | 51-52          | +35%
-```
-
 ---
