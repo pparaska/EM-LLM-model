@@ -187,7 +187,7 @@ class MemoryBlock:
         load_to_disk: bool = False,
         cpu_cache: Optional[CudaCache] = None,
     ):
-        # disk offload setup (first-phase directory sharding)
+        # Disk offload setup (first-phase directory sharding)
         if allow_disk_offload is not False:
             self.allow_disk_offload = True
             self.id = MemoryBlock._instance_counter
@@ -206,8 +206,16 @@ class MemoryBlock:
 
         # host (CPU) copies
         if load_to_disk:
-            torch.save(kv[0].contiguous(), os.path.join(self.offload_dir, f"0/{self.id}.pt"), pickle_protocol=4)
-            torch.save(kv[1].contiguous(), os.path.join(self.offload_dir, f"1/{self.id}.pt"), pickle_protocol=4)
+            torch.save(
+                kv[0].contiguous(),
+                os.path.join(self.offload_dir, f"0/{self.id}.pt"),
+                pickle_protocol=4,
+            )
+            torch.save(
+                kv[1].contiguous(),
+                os.path.join(self.offload_dir, f"1/{self.id}.pt"),
+                pickle_protocol=4,
+            )
             self.on_disk = True
             cpu_data = None
             self.cpu_data_id = None
@@ -245,7 +253,7 @@ class MemoryBlock:
         self.dim_head = dim_head
         self.pin_memory = pin_memory
 
-        # disk offload setup (second-phase base dir)
+        # Disk offload setup (second-phase base dir)
         if allow_disk_offload is not False:
             self.allow_disk_offload = True
             self.offload_dir = offload_dir
@@ -634,7 +642,7 @@ class ContextManager:
 
         # live q-heads (set per forward by the caller)
         self._live_q_heads = None
-        # retrieval weighting
+        # retrieval weighting (optional)
         self.qk_retrieval = kwargs.get("qk_retrieval", True)
         self.qk_weight = float(kwargs.get("qk_weight", 1.0))
         self.qk_top_h = int(kwargs.get("qk_top_h", 0))
@@ -647,7 +655,7 @@ class ContextManager:
             self._live_q_heads = None
 
     def _init(self, local_q, local_k, local_v, global_q, global_k, global_v):
-        self.block_muK = [[] for _ in range(self.batch_size)]
+        # NOTE: batch_size must be read before using it anywhere else
         assert local_q.dim() == 4
         batch_size, num_heads, len_q, dim_head = local_q.shape
         num_heads_kv = local_k.size(1)
@@ -674,14 +682,20 @@ class ContextManager:
         if self.use_contiguity_buffer:
             self.contiguity_buffer = [[] for _ in range(self.batch_size)]
 
+        # Representative K (mean of top-k tokens per block) used for similarity retrieval
         self.block_repr_k = [
             VectorTensor(dim_head * self.num_heads, global_k.dtype, self.layer_idx, device=local_k.device)
             for _ in range(self.batch_size)
         ]
 
+        # Per-block mean-K signatures for optional Q–μK retrieval
+        self.block_muK = [[] for _ in range(self.batch_size)]
+
+        # Local KV cache
         self.local_k = torch.empty((self.batch_size, self.num_heads_kv, 0, dim_head), dtype=local_k.dtype, device=local_k.device)
         self.local_v = torch.empty((self.batch_size, self.num_heads_kv, 0, dim_head), dtype=local_v.dtype, device=local_v.device)
 
+        # Global remainder buffers
         self.global_remainder = (
             torch.empty((self.batch_size, self.num_heads_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device),
             torch.empty((self.batch_size, self.num_heads_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device),
@@ -700,6 +714,7 @@ class ContextManager:
             (self.batch_size, self.num_heads_kv, self.max_block_size, self.dim_head), dtype=global_k.dtype, device=global_k.device
         )
 
+        # Initial tokens (attention sink)
         self.init_k = torch.empty((self.batch_size, self.num_heads_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device)
         self.init_v = torch.empty((self.batch_size, self.num_heads_kv, 0, dim_head), dtype=global_k.dtype, device=global_k.device)
         self.init_exc = False
@@ -709,6 +724,7 @@ class ContextManager:
             self.n_local + self.exc_block_size + 1, local_k.device, local_k.dim()
         )
 
+        # Retrieved KV memory buffer
         buffer_len = self.global_context_cap + 2 * self.max_block_size
         self.global_buffer = torch.empty(
             (2, self.batch_size, self.num_heads_kv, buffer_len, dim_head),
@@ -718,6 +734,7 @@ class ContextManager:
         self.global_buffer_init_st = 0
         self.global_buffer_init_ed = 0
 
+        # Cached memory blocks
         cuda_cache_device = local_k.device if self.use_hf_acc else "cuda"
         self.cuda_cache = CudaCache(
             self.max_cached_block * self.batch_size,
@@ -814,7 +831,8 @@ class ContextManager:
 
         retrieved_blocks = []
         for u in range(self.batch_size):
-            # Optional Q–μK scoring (layer/head-aware)
+            # Optional Q–μK scoring (layer/head-aware). Currently computed but not combined;
+            # hook here if you want to blend with repr similarity using self.qk_weight.
             use_qk = self.qk_retrieval and (self._live_q_heads is not None) and (len(self.block_muK[u]) > 0)
             if use_qk:
                 qn = self._live_q_heads  # (H, Dh)
@@ -833,7 +851,7 @@ class ContextManager:
                         block_scores_qk = torch.topk(sims, k=self.qk_top_h, dim=1).values.mean(dim=1)  # (B,)
                     else:
                         block_scores_qk = sims.max(dim=1).values  # (B,)
-                    # You can combine block_scores_qk with repr similarity if desired.
+                    # You could combine block_scores_qk with repr similarity here.
 
             if self.random_topk_blocks:
                 sorted_block_idx = list(range(self.num_global_block))
@@ -1135,12 +1153,12 @@ class ContextManager:
         if self.async_global_stream:
             GLOBAL_STREAM.wait_stream(torch.cuda.current_stream())
 
-        # concat local kv cache to inputs
+        # Concat local KV cache to inputs
         self.local_k = torch.cat((self.local_k, local_k), dim=-2)
         self.local_v = torch.cat((self.local_v, local_v), dim=-2)
         self.kv_length = self.local_k.size(-2)
 
-        # append global remainder
+        # Append global remainder
         with torch.cuda.stream(GLOBAL_STREAM):
             global_q = self.position_embedding.apply_rotary_pos_emb_one_angle(global_q, self.n_local)
 
@@ -1176,7 +1194,7 @@ class ContextManager:
             self.global_block_divide = torch.cat(
                 (
                     self.global_block_divide,
-                    torch.zeros((self.batch_size, global_k.size(-2)), dtype=global_k.dtype, device=global_k.device),
+                    torch.zeros((self.batch_size, global_k.size(-2)), dtype=torch.bool, device=global_k.device),
                 ),
                 dim=-1,
             )
@@ -1235,8 +1253,14 @@ class ContextManager:
                 global_k = self.global_remainder[0]
                 global_v = self.global_remainder[1]
                 append_init_len = min(self.n_init - self.init_k.size(-2), global_remainder_len - self.n_local)
-                self.init_k = torch.cat((self.init_k, global_k[:, :, global_remainder_st : global_remainder_st + append_init_len, :]), dim=-2)
-                self.init_v = torch.cat((self.init_v, global_v[:, :, global_remainder_st : global_remainder_st + append_init_len, :]), dim=-2)
+                self.init_k = torch.cat(
+                    (self.init_k, global_k[:, :, global_remainder_st : global_remainder_st + append_init_len, :]),
+                    dim=-2,
+                )
+                self.init_v = torch.cat(
+                    (self.init_v, global_v[:, :, global_remainder_st : global_remainder_st + append_init_len, :]),
+                    dim=-2,
+                )
                 global_remainder_st += append_init_len
                 global_remainder_len -= append_init_len
                 if self.init_k.size(-2) == self.n_init:
@@ -1291,7 +1315,7 @@ class ContextManager:
 
         self.length += exc_length
 
-        # prune local
+        # Prune local KV
         if self.local_k.size(-2) >= self.n_local:
             self.local_k = self.local_k[:, :, -self.n_local :, :]
             self.local_v = self.local_v[:, :, -self.n_local :, :]
