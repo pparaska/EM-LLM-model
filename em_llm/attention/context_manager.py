@@ -1,3 +1,46 @@
+"""
+Context retrieval and memory management utilities for long-context attention.
+
+This module implements a block-based memory system for transformer attention layers.
+It maintains Key/Value (KV) tensors for past tokens in a hierarchy spanning GPU
+(quick access), CPU (warm cache), and disk (cold storage). The high-level flow is:
+
+1) During each forward pass, the most recent tokens are kept in a local sliding window
+   (n_local). In parallel, older tokens are grouped into MemoryBlocks (global blocks)
+   built from the running global remainder stream and optionally segmented by surprisal.
+
+2) The ContextManager ranks previously stored blocks using representation similarity
+   (repr_score, derived from attention) and optionally Q–μK relevance (a head-aware
+   cosine similarity between current mean Q heads and each block’s mean K heads).
+   It then loads the top blocks back to GPU and forms a contiguous global buffer for
+   multi-stage attention (local + recalled global, with complement sliding window).
+
+3) The system manages placement across GPU, CPU, and disk, enforcing token budgets,
+   LRU eviction, and optional CPU/disk offloading under constrained memory.
+
+Main classes:
+- CudaCache:          A fixed-size allocator over a pre-allocated torch.Tensor buffer
+                      (device can be CUDA or CPU). Used for pooling and reusing
+                      contiguous memory for MemoryBlock data.
+- MemoryBlock:        Encapsulates a block of KV tensors. It can live in GPU cache,
+                      CPU cache, or be offloaded to disk as .pt shards. Provides
+                      load()/get()/offload() to move data as needed.
+- VectorTensor:       A dynamically growing 2D tensor array with similarity utilities,
+                      used to store per-block representations for ranking.
+- ContextManager:     Layer-level orchestrator. Builds blocks, tracks caches,
+                      computes rankings, retrieves blocks, and runs attention.
+
+Notes:
+- Q–μK scoring: we compute a per-block mean K (μK) over its span and compare to the
+  live mean Q heads of the current forward pass for head-aware relevance.
+- Surprisal blocking: optional segmentation logic that divides the global stream
+  into blocks based on surprisal spikes (or by uniform chunking if enabled).
+- Offloading: CPU and disk offload are optional; file structure is sharded for scale.
+
+This module is framework-agnostic except for PyTorch, and is designed to be called by
+patched transformer attention code (e.g., via TorchMultiStageDotProductAttention).
+"""
+
 import os
 import random
 import functools
@@ -8,12 +51,41 @@ from .dot_product_attention import TorchMultiStageDotProductAttention
 
 
 class CudaCache:
+    """A simple fixed-size memory pool backed by a single pre-allocated tensor.
+
+    The cache exposes `alloc()` / `delete()` to carve out and return contiguous
+    slices ("units") of the backing storage. It does not implement compaction—
+    indices are reused via an idle set.
+
+    Parameters
+    ----------
+    num_units : int
+        Number of allocatable units.
+    unit_size : int
+        Number of elements in each unit (flattened). The backing tensor shape is
+        (num_units, unit_size).
+    max_block_size : int
+        Maximum token length for any MemoryBlock. Used to reshape views.
+    dtype : torch.dtype
+        Data type for the backing tensor.
+    device : str or torch.device, default 'cuda'
+        Device where the backing tensor is allocated. Use 'cpu' for CPU caches.
+
+    Attributes
+    ----------
+    data : torch.Tensor
+        The backing tensor of shape (num_units, unit_size).
+    idle_set : set[int]
+        Indices of free units available for allocation.
+    """
+
     def __init__(self, num_units, unit_size, max_block_size, dtype, device='cuda',
                  qk_retrieval: bool = True, qk_weight: float = 1.0, qk_top_h: int = 0):
+        # The qk_* arguments are accepted for constructor symmetry but unused here.
         self.qk_retrieval = qk_retrieval
         self.qk_weight = float(qk_weight)
         self.qk_top_h = int(qk_top_h)
-        self._live_q_heads = None  # (H, Dh)
+        self._live_q_heads = None  # (H, Dh) — unused in CudaCache
 
         self.num_units = num_units
         self.unit_size = unit_size
@@ -23,16 +95,85 @@ class CudaCache:
         self.max_block_size = max_block_size
 
     def alloc(self):
+        """Allocate a free unit from the pool.
+
+        Returns
+        -------
+        (view, idx) : Tuple[torch.Tensor, int]
+            A 1D view tensor of length `unit_size` and the index of the unit.
+
+        Raises
+        ------
+        AssertionError
+            If there are no free units left.
+        """
         assert len(self.idle_set) > 0, "No more idle units in cache."
         idx = self.idle_set.pop()
         return self.data[idx], idx
 
     def delete(self, idx):
+        """Return a previously allocated unit back to the idle set.
+
+        Parameters
+        ----------
+        idx : int
+            Unit index returned by `alloc()`.
+        """
         assert idx not in self.idle_set
         self.idle_set.add(idx)
 
 
 class MemoryBlock:
+    """Container for a single block of K/V tensors with hierarchical residency.
+
+    Each block may reside on:
+    - GPU (through a `CudaCache` on a CUDA device) for fast attention reuse,
+    - CPU (through a `CudaCache` on CPU) as a warm cache,
+    - Disk (two .pt files for K and V) as cold storage.
+
+    It supports moving between tiers via `load()`, `get()`, `offload()`, and
+    `offload_to_disk()`. Disk files are cleaned up on deletion if enabled.
+
+    Parameters
+    ----------
+    kv : Tuple[torch.Tensor, torch.Tensor]
+        Tensors shaped (H_kv, span, Dh) for K and V.
+    cache : CudaCache
+        GPU cache pool used when loading block data onto the device.
+    load_to_cache : bool, default False
+        If True, immediately allocate a GPU unit and copy `kv` onto it.
+    pin_memory : bool, default False
+        If True, pin the CPU copies to speed up H2D transfers.
+    allow_disk_offload : bool, default False
+        If True, enable disk offloading and file cleanup.
+    offload_dir : str, default './offload_data'
+        Base directory for on-disk shards.
+    load_to_disk : bool, default False
+        If True, store the initial CPU representation directly to disk and
+        free CPU memory.
+    cpu_cache : Optional[CudaCache], default None
+        CPU cache pool. If provided, CPU copies are stored in this pool; else
+        they live as standalone CPU tensors.
+
+    Attributes
+    ----------
+    cpu_data : Optional[Tuple[torch.Tensor, torch.Tensor]]
+        CPU copies if resident on CPU cache or standalone tensors.
+    gpu_data : Optional[torch.Tensor]
+        View over a GPU cache unit shaped as (2, H_kv, max_block_size, Dh),
+        containing K at index 0 and V at index 1. Only the first `size`
+        positions are valid for this block.
+    size : int
+        Actual token span of this block.
+    num_heads_kv : int
+        Number of KV heads.
+    dim_head : int
+        Per-head dimension.
+    on_disk : bool
+        Whether the block has been offloaded to disk.
+    """
+
+    # individual event's KV store
     _instance_counter = 0
 
     def __init__(
@@ -63,7 +204,7 @@ class MemoryBlock:
         self.on_disk = False
         assert size <= self.cache.max_block_size
 
-        # host copies
+        # host (CPU) copies
         if load_to_disk:
             torch.save(kv[0].contiguous(), os.path.join(self.offload_dir, f"0/{self.id}.pt"), pickle_protocol=4)
             torch.save(kv[1].contiguous(), os.path.join(self.offload_dir, f"1/{self.id}.pt"), pickle_protocol=4)
@@ -84,7 +225,7 @@ class MemoryBlock:
             if pin_memory:
                 cpu_data = tuple(_t.pin_memory() for _t in cpu_data)
 
-        # device copies
+        # device (GPU) copies
         if load_to_cache:
             gpu_data, gpu_data_id = cache.alloc()
             gpu_data = gpu_data.view((2, num_heads_kv, self.cache.max_block_size, dim_head))
@@ -115,10 +256,33 @@ class MemoryBlock:
             self.allow_disk_offload = False
 
     def __del__(self):
+        """Clean up disk shards if disk offload is enabled."""
         if hasattr(self, "allow_disk_offload") and self.allow_disk_offload:
             self._delete_from_disk()
 
     def load(self, target: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, load_cache: bool = True):
+        """Ensure the block is resident on GPU, copying from CPU/disk if needed.
+
+        Parameters
+        ----------
+        target : Optional[Tuple[torch.Tensor, torch.Tensor]]
+            Optional pre-allocated (K, V) slices on GPU to copy into. Shapes must
+            be (H_kv, size, Dh). If provided, we copy into both `target` and the
+            GPU cache unit to avoid redundant reads.
+        load_cache : bool
+            Unused flag kept for interface compatibility.
+
+        Returns
+        -------
+        (loaded, target_event) : Tuple[bool, Optional[torch.cuda.Event]]
+            loaded = True if we allocated a new GPU cache unit this call.
+            target_event is a CUDA event recorded after copies into `target`.
+
+        Raises
+        ------
+        AssertionError
+            If CPU data is unexpectedly missing and not on disk.
+        """
         target_event = None
         if self.cpu_data is None:
             assert self.on_disk, "CPU data is None but on_disk is also set to False"
@@ -158,11 +322,21 @@ class MemoryBlock:
         return True, target_event
 
     def get(self):
+        """Return the resident GPU data (K/V) for this block.
+
+        Waits for the copy `event` before returning to ensure data readiness.
+
+        Returns
+        -------
+        torch.Tensor
+            A view shaped as (2, H_kv, size, Dh) containing K then V.
+        """
         assert self.gpu_data is not None
         self.event.wait()
         return self.gpu_data[:, :, :self.size, :]
 
     def offload(self):
+        """Drop the GPU residency of this block and free the cache unit."""
         assert self.gpu_data is not None
         self.event.wait()
         self.gpu_data = None
@@ -170,6 +344,7 @@ class MemoryBlock:
         self.gpu_data_id = None
 
     def offload_to_disk(self):
+        """Persist CPU data to disk as two .pt files and free CPU cache memory."""
         if not self.on_disk:
             torch.save(
                 self.cpu_data[0][:, :self.size, :].clone(),
@@ -187,6 +362,7 @@ class MemoryBlock:
         self.cpu_data_id = None
 
     def _load_from_disk(self):
+        """Load CPU tensors from disk into the CPU cache."""
         self.cpu_data, self.cpu_data_id = self.cpu_cache.alloc()
         self.cpu_data = self.cpu_data.view((2, self.num_heads_kv, self.cache.max_block_size, self.dim_head))
         self.cpu_data[0, :, :self.size, :].copy_(
@@ -197,12 +373,30 @@ class MemoryBlock:
         )
 
     def _delete_from_disk(self):
+        """Delete on-disk shards if present."""
         if self.on_disk:
             os.remove(os.path.join(self.offload_dir, f"0/{self.id}.pt"))
             os.remove(os.path.join(self.offload_dir, f"1/{self.id}.pt"))
 
 
 class VectorTensor:
+    """A growable 2D tensor with similarity utilities for ranking blocks.
+
+    Used to store per-block representation vectors (e.g., averaged repr K per block)
+    and compute similarity against a query (e.g., the current step’s mean Q).
+
+    Parameters
+    ----------
+    hidden_size : int
+        Vector dimensionality per row.
+    element_dtype : torch.dtype
+        Dtype for the tensor storage.
+    layer_idx : int
+        Layer identifier (for logging/debugging).
+    device : str or torch.device, default 'cuda'
+        Device to store the data.
+    """
+
     def __init__(self, hidden_size, element_dtype, layer_idx, device="cuda"):
         init_cached_size = 16
         self.data = torch.empty((init_cached_size, hidden_size), dtype=element_dtype, device=device)
@@ -212,6 +406,7 @@ class VectorTensor:
         self.layer_idx = layer_idx
 
     def append_cache(self):
+        """Increase underlying capacity by a fixed step to amortize reallocations."""
         new_cache_size = self.cache_size + 128
         data_shape = self.data.shape
         new_data = torch.empty((new_cache_size,) + data_shape[1:], device=self.data.device, dtype=self.data.dtype)
@@ -220,6 +415,13 @@ class VectorTensor:
         self.cache_size = new_cache_size
 
     def append(self, tensor: torch.Tensor):
+        """Append one or more vectors to the end of the array.
+
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            2D tensor of shape (N, hidden_size), contiguous and dtype-matching.
+        """
         assert tensor.dtype == self.data.dtype
         assert tensor.size(1) == self.hidden_size
         assert tensor.is_contiguous()
@@ -230,30 +432,130 @@ class VectorTensor:
         self.length += append_l
 
     def get_data(self):
+        """Return a view of valid rows currently stored."""
         return self.data[: self.length, ...]
 
     def get_similarity(self, tensor: torch.Tensor):
+        """Compute dot-product similarity between all rows and a 1D query vector.
+
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            1D vector of shape (hidden_size,).
+
+        Returns
+        -------
+        torch.Tensor
+            1D tensor of length `len(self)` containing similarities.
+        """
         assert tensor.dim() == 1 and tensor.size(0) == self.hidden_size
         logits = torch.matmul(self.data[: self.length], tensor[:, None].to(self.data.device)).squeeze(dim=-1)
         assert logits.dim() == 1 and logits.size(0) == self.length
         return logits
 
     def get_topk(self, tensor: torch.Tensor, topk):
+        """Return indices of the top-k most similar rows to the query vector."""
         logits = self.get_similarity(tensor)
         return logits.topk(topk, dim=0).indices
 
     def sort_by_similarity(self, tensor: torch.Tensor):
+        """Return row indices sorted by similarity to the query vector (desc)."""
         logits = self.get_similarity(tensor)
         return torch.sort(logits, descending=True).indices.cpu().tolist()
 
     def __len__(self):
+        """Number of valid rows currently stored."""
         return self.length
 
 
 GLOBAL_STREAM = None
 
-
 class ContextManager:
+    """Layer-level orchestrator for block creation, ranking, retrieval, and attention.
+
+    Typical cycle per forward pass:
+    1) `_init()` once to set shapes, buffers, caches.
+    2) `append()` with the most recent local/global QKV slices to extend the
+       running global remainder and perform retrieval+attention.
+    3) `update_memory()` to segment the global remainder into blocks (via surprisal
+       or uniform) and finalize residency/offloading decisions.
+
+    Parameters
+    ----------
+    layer_idx : int
+        Layer identifier for logging/debugging.
+    position_embedding : object
+        Provides rotary position methods: `apply_rotary_pos_emb_one_angle` and
+        `_update_cos_sin_tables_len`.
+    n_init : int
+        Initial global tokens to always include (prefix) when length > n_local.
+    n_local : int
+        Sliding window length used as the local context.
+    max_block_size : int
+        Upper bound on block span (tokens) used during segmentation and storage.
+    max_cached_block : int
+        Maximum number of blocks that can be resident in the GPU cache per batch.
+    exc_block_size : int
+        Max number of new tokens appended per `append()` call (sanity check).
+    min_block_size : int, default 1
+        Minimum allowable block span when segmenting.
+    async_global_stream : bool, default True
+        Use a dedicated CUDA stream for global copies and block management.
+    pin_memory : bool, default False
+        Pin host memory buffers for faster H2D copies.
+    perhead : bool, default False
+        If True, expands QKV to per-head batch for attention (debug/experiments).
+    repr_topk : int, default 1
+        Number of top tokens per head used to form each block’s representation K.
+    surprisal_threshold_gamma : float, default 1.1
+        Multiplier on std-dev above mean to mark segmentation boundaries.
+    n_mem : int, default 2048
+        Budget for recalled global tokens (beyond n_init and exc_block_size).
+    uniform_blocks : bool, default False
+        If True, segment by fixed-size chunks rather than surprisal.
+    random_topk_blocks : bool, default False
+        If True, pick blocks randomly instead of similarity ranking (ablations).
+    similarity_refinement : bool, default False
+        Placeholder for graph-theoretic refinements (not active in this code).
+    refine_with_buffer : bool, default False
+        Placeholder toggle for refinement with a contiguity buffer.
+    refine_from_layer : int, default 0
+        Placeholder layer index from which refinements apply.
+    similarity_metric : str, default 'modularity'
+        Placeholder string name for refinement metric.
+    use_contiguity_buffer : bool, default False
+        If True, allocate part of budget to neighbors of selected blocks.
+    contiguity_buffer_size : float, default 0.3
+        Buffer size in tokens (int) or fraction (0..1) of remaining budget.
+    use_hf_acc : bool, default False
+        If True, move certain tensors to the right device when using HF accelerators.
+    disk_offload_dir : str, default './offload_data'
+        Directory for block shards if disk offload is enabled.
+    allow_disk_offload : bool, default False
+        Toggle for CPU/disk hierarchical offload.
+    vector_offload : bool, default False
+        If True and single-GPU, offload VectorTensor to CPU to reduce VRAM.
+
+    Additional kwargs
+    ------------------
+    min_free_cpu_memory : float (GB), default 100
+        Guardrail for CPU memory when allocating CPU cache.
+    world_size : int, default depends on GPUs
+        Controls CPU cache sizing per process.
+    qk_retrieval : bool, default True
+        Enable head-aware Q–μK relevance scoring.
+    qk_weight : float, default 1.0
+        Weighting for combining Q–μK with representation similarity (hook).
+    qk_top_h : int, default 0
+        If >0, use top-H head similarities per block; else use max over heads.
+    """
+
+    # """
+    # Orchestrates everything for one layer: builds blocks from the stream, maintains caches and offloading,
+    # computes similarity ranking and picks which blocks to recall, loads recalled KV into a contiguous global
+    # buffer used for attention.
+    # """
+
     def __init__(
         self,
         layer_idx,
