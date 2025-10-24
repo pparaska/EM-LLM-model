@@ -1,3 +1,24 @@
+"""
+EM-LLM forward patches for attention and causal language modeling.
+
+This module provides:
+- em_llm_attn_forward: a factory that returns a patched attention forward
+  function compatible with HF-style attention blocks. It wires a ContextManager
+  that segments the stream into local+global memory blocks, performs optional
+  surprisal-based boundary detection, and can refine boundaries using a
+  graph-theoretic similarity objective.
+- em_llm_causal_lm_forward: a replacement for a model's generate-time / train-time
+  forward that computes logits and (optionally) a cross-entropy loss, derives
+  surprisal or consumes a boolean boundary mask, performs optional similarity
+  refinement of event boundaries, and updates the ContextManager memories.
+
+Key ideas:
+- Local window + global episodic blocks with optional contiguity buffer.
+- Surprisal-driven event boundaries, optionally refined via modularity /
+  conductance / intra–inter similarity on a token–token similarity matrix.
+- Optional Q–μK retrieval (head-aware relevance between current Q and block summaries).
+"""
+
 import torch
 from torch.nn import CrossEntropyLoss, MSELoss  # MSELoss imported but unused
 from typing import List, Optional, Tuple, Union
@@ -29,6 +50,74 @@ def em_llm_attn_forward(
     uniform_blocks=False,
     *args, **kwargs
 ):
+    """
+    Factory that returns a patched attention forward function integrating EM-LLM memory.
+
+    This wraps a Hugging Face-style attention block so that each call:
+      1) Projects Q/K/V (shared or separate projection supported).
+      2) Hands them to a ContextManager that maintains local window + global
+         memory blocks (episodic cache).
+      3) Performs attention over local and (optionally) retrieved global blocks.
+      4) Optionally uses surprisal-driven event boundaries and similarity-based
+         refinement (see em_llm_causal_lm_forward for how surprisal is produced).
+
+    Parameters
+    ----------
+    model : nn.Module
+        Parent model or module providing config/context (not directly used here,
+        but useful for compatibility).
+    n_local : int
+        Size of the sliding local attention window.
+    n_init : int
+        Minimum prefix kept before episodic segmentation begins.
+    max_block_size : int
+        Maximum token span for a single global memory block.
+    max_cached_block : int
+        Cap on how many global blocks to cache.
+    exc_block_size : int
+        Execution chunk size (number of new tokens processed per append).
+    repr_topk : int, default 1
+        Number of representative blocks to retrieve per step (if retrieval used).
+    surprisal_threshold_gamma : float, default 1.1
+        Multiplier for std when thresholding surprisal spikes to mark boundaries.
+    async_global_stream : bool, default True
+        If True, stream global K/V asynchronously to overlap compute.
+    pin_memory : bool, default False
+        Pin host memory for faster H2D transfers (when applicable).
+    perhead : bool, default False
+        If True, maintain per-head memories/logic in ContextManager.
+    n_mem : int, default 2048
+        Total memory budget (tokens) for global blocks.
+    min_block_size : int, default 1
+        Minimum allowed size for a block after refinement.
+    block_similarity_topk : int or bool, default False
+        If set to int, restrict refinement scoring to top-k candidate blocks.
+    similarity_refinement_kwargs : dict, default {}
+        Extra args forwarded to similarity refinement (e.g., similarity_metric).
+    contiguity_buffer_kwargs : dict, default {}
+        Settings for contiguity buffer (reserving tokens between events).
+    random_topk_blocks : bool, default False
+        If True, sample retrieval candidates randomly (for ablations).
+    infini_attention : bool, default False
+        If True, enable compatibility mode with Infini-attention style caches.
+    uniform_blocks : bool, default False
+        If True, disables surprisal-based adaptive boundaries (uniform splits).
+    *args, **kwargs
+        Additional options forwarded to ContextManager (e.g., qk_retrieval, qk_weight, qk_top_h).
+
+    Returns
+    -------
+    callable
+        A closure `forward(self, query, key_value, position_bias, use_cache, past_key_value, ...)`
+        that replaces the attention forward and returns:
+            (context_output, None, past_key_value)
+
+    Notes
+    -----
+    - The returned forward assumes use_cache=True (KV caching enabled).
+    - Q–μK retrieval can be toggled via kwargs: qk_retrieval, qk_weight, qk_top_h.
+    """
+
     def forward(
         self,
         query: torch.Tensor,
@@ -44,6 +133,47 @@ def em_llm_attn_forward(
         num_heads,
         num_heads_kv,
     ):
+        """
+        Patched attention forward that routes Q/K/V through ContextManager.
+
+        Parameters
+        ----------
+        query : Tensor, shape (B, T_q, D_in)
+            Input hidden states for queries.
+        key_value : Tensor, shape (B, T_kv, D_in)
+            Input hidden states for keys/values.
+        position_bias : Tensor or None
+            Optional positional bias/embedding for the layer.
+        use_cache : bool
+            Must be True; enables KV caching and episodic memory.
+        past_key_value : Any or None
+            ContextManager instance for this layer; constructed on first call.
+        project_q, project_k, project_v : callable or nn.Module
+            Linear projections for Q/K/V (or fused qkv if project_k is None).
+        attention_out : callable or nn.Module
+            Output projection applied to the concatenated head outputs.
+        dim_head : int
+            Per-head dimensionality.
+        num_heads : int
+            Number of attention heads for Q.
+        num_heads_kv : int
+            Number of attention heads for K/V (may be <= num_heads).
+
+        Returns
+        -------
+        o : Tensor, shape (B, T_q, D_out)
+            Attention output after local + global memory attention and output proj.
+        None
+            Placeholder to match HF attention signature (past_attn_probs, unused).
+        past_key_value : ContextManager
+            Updated ContextManager carrying caches, blocks, and state.
+
+        Side Effects
+        ------------
+        - On first call, constructs a ContextManager with the configured memory
+          and refinement options.
+        - Updates internal episodic/global caches via ContextManager.append().
+        """
         batch_size = query.size(0)
         len_q = query.size(1)
         len_k = key_value.size(1)
@@ -129,6 +259,77 @@ def em_llm_causal_lm_forward(
     em_labels: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> Union[Tuple, CausalLMOutputWithPast]:
+    """
+    Causal LM forward with EM-LLM surprisal and optional similarity refinement.
+
+    This drop-in forward computes logits (and optional cross-entropy loss), derives
+    surprisal per token (or accepts a boolean boundary mask), optionally refines
+    event boundaries using a graph-based similarity objective, and updates the
+    per-layer ContextManager memories.
+
+    Parameters
+    ----------
+    self : PreTrainedModel
+        HF-style causal LM (must expose .model (backbone) and .lm_head).
+    input_ids : LongTensor, shape (B, T), optional
+        Token ids. Mutually exclusive with inputs_embeds.
+    attention_mask : Tensor, optional
+        Standard attention mask.
+    position_ids : LongTensor, optional
+        Positional ids when model requires explicit positions.
+    past_key_values : list[Any], optional
+        Per-layer ContextManager instances (created on first pass if None).
+    inputs_embeds : FloatTensor, shape (B, T, D), optional
+        Embedded inputs as an alternative to input_ids.
+    labels : LongTensor, shape (B, T), optional
+        If provided, compute cross-entropy loss against logits.
+    use_cache : bool, optional
+        Enable KV caching; should be True for EM-LLM memory behavior.
+    output_attentions : bool, optional
+        Pass-through to backbone.
+    output_hidden_states : bool, optional
+        Pass-through to backbone.
+    return_dict : bool, optional
+        If True, return CausalLMOutputWithPast.
+    em_labels : Tensor, optional
+        If dtype != bool: token ids used to compute surprisal = -log p(token).
+        If dtype == bool: treated as a precomputed boundary mask (True at cuts).
+
+    kwargs : dict
+        Unused here; accepted for compatibility.
+
+    Returns
+    -------
+    CausalLMOutputWithPast
+        loss : Tensor or None
+            Cross-entropy loss if labels provided.
+        logits : FloatTensor, shape (B, T, V)
+            Unnormalized token logits.
+        past_key_values : list[ContextManager]
+            Updated per-layer episodic memory state.
+        hidden_states, attentions : optional
+            Pass-through from backbone if requested.
+
+    Boundary Detection and Refinement
+    ---------------------------------
+    1) If em_labels is token ids (non-bool), the function computes per-token
+       surprisal and detects boundary positions by thresholding against a
+       running mean/std (gamma multiplier).
+    2) If similarity_refinement is enabled on the ContextManager, the function:
+       - stacks K across layers for the recent window,
+       - builds a token–token similarity matrix via dot products,
+       - refines each tentative boundary within a local window by optimizing a
+         graph criterion (modularity / conductance / intra–inter sim),
+       - replaces the raw thresholded mask with the refined mask.
+    3) The refined boolean boundary mask is passed to each layer’s
+       ContextManager.update_memory() to finalize blocks.
+
+    Notes
+    -----
+    - When uniform_blocks is True, surprisal segmentation is skipped (uniform splits).
+    - Surprisal refinement uses only a suffix of the stream (global remainder).
+    - All tensor device transfers are best-effort; falls back gracefully if needed.
+    """
     r"""
     Args:
         labels (torch.LongTensor, optional): shape (batch_size, seq_len)

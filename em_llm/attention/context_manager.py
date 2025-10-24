@@ -752,17 +752,48 @@ class ContextManager:
         self.initialized = True
 
     def _init_cpu_cache(self, local_q, local_k):
+        """
+        Initialize a CPU-resident cache for KV blocks when disk offload is enabled.
+
+        What it does
+        ------------
+        - Computes the maximum CPU memory we can use (respecting a minimum free-memory guard).
+        - Estimates the per-token KV memory footprint and derives how many blocks can fit on CPU.
+        - Allocates a CudaCache-like structure on CPU to hold offloaded KV blocks.
+
+        Parameters
+        ----------
+        local_q : torch.Tensor
+            Local query tensor with shape (B, H, T_local, Dh). Used to read head dim (Dh).
+        local_k : torch.Tensor
+            Local key tensor with shape (B, H_kv, T_local, Dh). Used to estimate token size.
+
+        Side Effects
+        ------------
+        - Sets self.max_cpu_cached_blocks.
+        - Creates and assigns self.cpu_cache (on CPU).
+        - Logs one-time info when layer_idx == 0.
+        """
         _, _, _, dim_head = local_q.shape
+
+    # Guardrail: keep at least min_free_cpu_memory GiB free across all ranks.
         max_cpu_cache_memory = int(
             max(
                 self.min_free_cpu_memory * (1024**3),
                 (psutil.virtual_memory().available - self.min_free_cpu_memory * (1024**3)) / self.world_size,
             )
         )
+
+        # Approx bytes per token for one head-group slice (same dtype as K)
         token_size = local_k[:, 0, :].element_size() * local_k[:, 0, :].numel()
+
+        # How many blocks of size `max_block_size` (K and V => ×2) fit into the budget
         self.max_cpu_cached_blocks = max_cpu_cache_memory // (token_size * 2 * self.max_block_size)
+
         if self.layer_idx == 0:
             print(f"Initialising CPU cache. Number of blocks allocated: {self.max_cpu_cached_blocks}")
+
+        # Each cache "unit" is sized for one block worth of K and V across all heads
         self.cpu_cache = CudaCache(
             self.max_cpu_cached_blocks * self.batch_size,
             self.unit_size_kv * self.max_block_size * dim_head * 2,
@@ -771,68 +802,151 @@ class ContextManager:
             device=torch.device("cpu"),
         )
 
+
     def _offload_vector(self):
+        """
+        Offload block-representation vectors (used for retrieval ranking) to CPU.
+
+        Notes
+        -----
+        - This reduces GPU memory pressure for very long contexts on single-GPU runs.
+        - Only touches the small per-block vectors, not full KV blocks.
+        """
         if self.layer_idx == 0:
             print("Offloading VectorTensor to CPU to run single-GPUs on long-contexts.")
         for u in range(self.batch_size):
+            # Move similarity vectors used by the retriever onto CPU
             self.block_repr_k[u].data = self.block_repr_k[u].data.to(torch.device("cpu"))
 
+
     def _num_memory_blocks(self):
+        """
+        Return the number of global memory blocks currently tracked for batch index 0.
+
+        Returns
+        -------
+        int
+            Count of memory blocks stored for u=0 (all batches should be aligned).
+        """
         return len(self.global_blocks[0])
 
+
     def _remove_lru_blocks(self, u, num_remove: Optional[int] = None, ignore_blocks=None):
+        """
+        Evict least-recently-used (LRU) blocks from GPU cache to satisfy a token budget.
+
+        Parameters
+        ----------
+        u : int
+            Batch index.
+        num_remove : int, optional
+            Number of tokens to remove from cache. If None, computed from overflow versus
+            self.max_total_retrieved_tokens.
+        ignore_blocks : Iterable[int] or None
+            Block indices that must not be evicted (e.g., currently selected top-k).
+
+        Side Effects
+        ------------
+        - May offload evicted blocks (GPU → CPU/disk) via block.offload().
+        - Updates self.cached_blocks[u] (LRU timestamps map).
+        """
         if num_remove is None:
             tokens_in_cache = sum([self.global_blocks[u][bidx].size for bidx in self.cached_blocks[u].keys()])
             num_remove = tokens_in_cache - self.max_total_retrieved_tokens
         if num_remove <= 0:
             return
+
+        # Sort blocks by last-access timestamp (ascending => LRU first)
         lst = list(self.cached_blocks[u].items())
         lst.sort(key=lambda x: x[1])
+
         removed = 0
         for idx, _ts in lst:
             if ignore_blocks is None or (idx not in ignore_blocks):
+                # Offload the block’s GPU content; metadata stays
                 self.global_blocks[u][idx].offload()
                 self.cached_blocks[u].pop(idx)
                 removed += self.global_blocks[u][idx].size
             if removed >= num_remove:
                 return
 
+
     def _remove_cpu_lru_blocks(self, ignore_blocks=None):
+        """
+        Ensure there are enough free CPU cache units by offloading least-used blocks to disk.
+
+        Parameters
+        ----------
+        ignore_blocks : Iterable[int] or None
+            Block indices that must not be offloaded to disk.
+
+        Notes
+        -----
+        - Triggers only if the CPU cache is nearly full based on exc + retrieved budget.
+        - Uses self.block_usage[u] timestamps to find cold blocks whose cpu_data exists.
+        """
         num_remove = ((self.exc_block_size + self.max_total_retrieved_tokens) // self.min_block_size) + 1 - len(
             self.cpu_cache.idle_set
         )
         if num_remove > 0:
             for u in range(self.batch_size):
                 lst = list(self.block_usage[u].items())
-                lst.sort(key=lambda x: x[1])
+                lst.sort(key=lambda x: x[1])  # LRU on CPU
                 removed = 0
                 for idx, _ts in lst:
                     if (ignore_blocks is None or idx not in ignore_blocks) and self.global_blocks[u][idx].cpu_data is not None:
-                        self.global_blocks[u][idx].offload_to_disk()
+                        self.global_blocks[u][idx].offload_to_disk()  # CPU → disk
                         removed += 1
                         if removed >= num_remove:
                             break
 
+
     def _calc_topk_blocks(self, len_q, global_q):
+        """
+        Select the next set of global memory blocks to retrieve given the current query.
+
+        Strategy
+        --------
+        - Compute effective global context capacity (reserves room for remainder/init and optional contiguity buffer).
+        - If everything fits, return all blocks.
+        - Otherwise, rank blocks by similarity between per-block representations and the flattened global query.
+        Optionally compute head-aware Q–μK scores (hook provided) for hybrid ranking.
+        - Accumulate blocks until capacity is filled (greedy, respects block sizes).
+
+        Parameters
+        ----------
+        len_q : int
+            Current local query length.
+        global_q : torch.Tensor
+            Global query (B, H, T_local, Dh) before flattening/mean.
+
+        Returns
+        -------
+        List[List[int]]
+            For each batch u, an ordered list of block indices to retrieve.
+        """
         global_remainder_len = max(self._global_remainder_ed - self._global_remainder_st + len_q - self.n_local, 0)
         global_context_cap = self.global_context_cap - global_remainder_len - (self.length > self.n_local) * self.init_k.size(-2)
+
+        # Reserve capacity for optional contiguity buffer
         if self.use_contiguity_buffer:
             if self.contiguity_buffer_size < 1:
                 global_context_cap -= int(self.contiguity_buffer_size * global_context_cap + 1)
             else:
                 global_context_cap -= self.contiguity_buffer_size
 
+        # If all blocks fit, just take them all
         if self.global_length[0] <= global_context_cap:
             return [list(range(len(self.global_blocks[0]))) for _ in range(self.batch_size)]
 
+        # Pool heads → (B, H*Dh) for retrieval scoring
         global_q = global_q.mean(dim=2, keepdim=False)
         assert global_q.shape == (self.batch_size, self.num_heads, self.dim_head)
         global_q = global_q.reshape(self.batch_size, self.dim_head * self.num_heads)
 
         retrieved_blocks = []
         for u in range(self.batch_size):
-            # Optional Q–μK scoring (layer/head-aware). Currently computed but not combined;
-            # hook here if you want to blend with repr similarity using self.qk_weight.
+            # Optional Q–μK scoring hook (currently not fused into final score)
             use_qk = self.qk_retrieval and (self._live_q_heads is not None) and (len(self.block_muK[u]) > 0)
             if use_qk:
                 qn = self._live_q_heads  # (H, Dh)
@@ -840,6 +954,7 @@ class ContextManager:
                 if len(mu_list) == len(self.block_muK[u]) and len(mu_list) > 0:
                     muK = torch.stack(mu_list, dim=0)  # (B, H_kv, Dh)
                     H_kv = muK.size(1)
+                    # Align μK heads to Q heads
                     if self.num_heads % H_kv == 0:
                         repeat = self.num_heads // H_kv
                         muK = muK.unsqueeze(2).expand(-1, H_kv, repeat, -1).reshape(muK.size(0), self.num_heads, self.dim_head)
@@ -851,8 +966,9 @@ class ContextManager:
                         block_scores_qk = torch.topk(sims, k=self.qk_top_h, dim=1).values.mean(dim=1)  # (B,)
                     else:
                         block_scores_qk = sims.max(dim=1).values  # (B,)
-                    # You could combine block_scores_qk with repr similarity here.
+                    # Combine here with repr similarity if desired using self.qk_weight.
 
+            # Sort by learned representation similarity or random (for debugging)
             if self.random_topk_blocks:
                 sorted_block_idx = list(range(self.num_global_block))
                 random.shuffle(sorted_block_idx)
@@ -860,6 +976,8 @@ class ContextManager:
                 sorted_block_idx = self.block_repr_k[u].sort_by_similarity(global_q[u])
 
             sorted_block_idx = iter(sorted_block_idx)
+
+            # Greedily pick blocks until capacity reached, honoring block sizes
             context_len = 0
             filled_global_context = False
             batch_retrieved_blocks = []
@@ -877,6 +995,7 @@ class ContextManager:
                     prev_context_len = context_len
                     context_len += self.global_blocks[u][cur].size
                     if context_len >= global_context_cap:
+                        # If we overshoot, keep the closer fit
                         if abs(global_context_cap - prev_context_len) <= abs(context_len - global_context_cap):
                             batch_retrieved_blocks.pop()
                             context_len -= self.global_blocks[u][cur].size
@@ -887,9 +1006,31 @@ class ContextManager:
 
         return retrieved_blocks
 
+
     def _update_contiguity_buffer(self, len_q, topk_blocks):
+        """
+        Build/refresh a contiguity buffer with neighbors of the selected top-k blocks.
+
+        Purpose
+        -------
+        - Encourages temporal/local continuity by prefetching adjacent blocks (+1, -1).
+        - Maintains a separate capacity budget for this buffer to avoid crowding out top-k.
+
+        Parameters
+        ----------
+        len_q : int
+            Current local query length.
+        topk_blocks : List[List[int]]
+            Top-k blocks per batch from _calc_topk_blocks.
+
+        Side Effects
+        ------------
+        - Updates self.contiguity_buffer[u] in place with a list of adjacent block indices.
+        """
         global_remainder_len = max(self._global_remainder_ed - self._global_remainder_st + len_q - self.n_local, 0)
         topk_global_context_cap = self.global_context_cap - global_remainder_len - (self.length > self.n_local) * self.init_k.size(-2)
+
+        # Compute contiguity capacity
         if self.contiguity_buffer_size < 1:
             ctg_global_context_cap = int(self.contiguity_buffer_size * topk_global_context_cap + 1)
         else:
@@ -902,6 +1043,8 @@ class ContextManager:
             context_len = 0
             filled_global_context = False
             batch_topk_blocks = iter(topk_blocks[u])
+
+            # Consider immediate neighbors around each chosen block
             while not filled_global_context:
                 bidx = next(batch_topk_blocks, None)
                 if bidx is None:
@@ -920,6 +1063,7 @@ class ContextManager:
                         filled_global_context = True
                         break
 
+            # Integrate with past buffer content (bounded by capacity)
             batch_ctg_blocks.reverse()
             if len(batch_ctg_blocks) > 0:
                 if len(self.contiguity_buffer[u]) == 0 or filled_global_context:
@@ -944,9 +1088,34 @@ class ContextManager:
                                     context_len -= self.global_blocks[u][cur].size
                                 break
 
+
     def _get_init_and_remainder_context(self, init_st, global_h_k, global_h_v, global_remainder_len):
+        """
+        Populate the global K/V buffers with:
+        - Initial context (init_k/init_v) if we've passed n_local,
+        - The current global remainder window,
+        and return a trimmed view plus the sliding window definition.
+
+        Parameters
+        ----------
+        init_st : int
+            Start index where init K/V should be written in the global buffer.
+        global_h_k, global_h_v : torch.Tensor
+            Preallocated global K/V buffers (B, H_kv, T_max, Dh).
+        global_remainder_len : int
+            Number of remainder tokens to append after init.
+
+        Returns
+        -------
+        global_h_k, global_h_v : torch.Tensor
+            Sliced views that include init + remainder segments only.
+        sliding_window : Tuple[int, int]
+            (absolute_end_of_remainder, n_local) used by attention to mask local vs global.
+        """
         init_len = self.init_k.size(-2)
         init_ed = init_st + init_len
+
+        # Write init context if we’ve progressed beyond local-only phase
         if self.length > self.n_local:
             global_h_k[:, :, init_st:init_ed, :].copy_(self.init_k, non_blocking=True)
             global_h_v[:, :, init_st:init_ed, :].copy_(self.init_v, non_blocking=True)
@@ -956,6 +1125,7 @@ class ContextManager:
         rmd_ed = rmd_st + global_remainder_len
         ed = rmd_ed
 
+        # Append the global remainder segment
         global_h_k[:, :, rmd_st:rmd_ed, :].copy_(
             self.global_remainder[0][:, :, self._global_remainder_st : self._global_remainder_st + global_remainder_len, :],
             non_blocking=True,
@@ -966,11 +1136,34 @@ class ContextManager:
         )
 
         sliding_window = (self.global_remainder[0].size(-2) + rmd_st, self.n_local)
+
+        # Trim to the filled region
         global_h_k = global_h_k[:, :, :ed, :]
         global_h_v = global_h_v[:, :, :ed, :]
         return global_h_k, global_h_v, sliding_window
 
+
     def _get_global_hidden_and_mask(self, len_q, topk_blocks):
+        """
+        Load selected global blocks (by index) into the global K/V buffers and
+        append init + remainder. Returns the buffers, sliding window, and init start.
+
+        Parameters
+        ----------
+        len_q : int
+            Current local query length.
+        topk_blocks : List[List[int]]
+            For each batch, the ordered block indices to load.
+
+        Returns
+        -------
+        global_h_k, global_h_v : torch.Tensor
+            Populated global K/V tensors of shape (B, H_kv, T_global_loaded, Dh).
+        sliding_window : Tuple[int, int]
+            (absolute_end_of_remainder, n_local) for masking.
+        init_st : int
+            The index where init context started (used by caller for layout bookkeeping).
+        """
         assert len(topk_blocks) == self.batch_size
         global_remainder_len = max(self._global_remainder_ed - self._global_remainder_st + len_q - self.n_local, 0)
 
@@ -982,11 +1175,13 @@ class ContextManager:
         for u in range(self.batch_size):
             assert len(topk_blocks[u]) == num_retrieved_blocks
             topk_blocks[u].sort()
+
             st = 0
             ed = 0
             for b_idx in topk_blocks[u]:
                 assert b_idx in self.cached_blocks[u]
                 ed = st + self.global_blocks[u][b_idx].size
+                # Load from cache (GPU or CPU/disk with staging) into global_h_*
                 self.global_blocks[u][b_idx].load((global_h_k[u, :, st:ed, :], global_h_v[u, :, st:ed, :]))
                 size += self.global_blocks[u][b_idx].size
                 st = ed
@@ -997,23 +1192,50 @@ class ContextManager:
         )
         return global_h_k, global_h_v, sliding_window, init_st
 
+
     def _retrieve_and_attend(self, local_q, local_k, local_v, global_q):
+        """
+        Core attention pass that:
+        1) Pos-embeds local Q/K and appends them to the local attention buffer,
+        2) Computes which global blocks to fetch,
+        3) Loads those blocks (plus init + remainder) into global K/V buffers,
+        4) Runs attention over [local | global] with complement sliding window masking.
+
+        Parameters
+        ----------
+        local_q, local_k, local_v : torch.Tensor
+            Local Q/K/V of shape (B, H or H_kv, T_local, Dh).
+        global_q : torch.Tensor
+            Global Q for retrieval scoring (same shape as local_q).
+
+        Returns
+        -------
+        torch.Tensor
+            Attention output of shape (B, H, T_local, Dh).
+        """
+        # Rotary/position embeddings for local segment
         local_h_q, local_h_k = self.position_embedding(local_q, local_k)
         local_h_v = local_v
         if self.use_hf_acc:
             local_h_q = local_h_q.to(local_q.device)
             local_h_k = local_h_k.to(local_k.device)
+
+        # Start attention accumulator with local window
         attn = self.Attn(local_h_q.shape, local_h_q.dtype, local_h_q.device)
         attn.append(local_h_q, local_h_k, local_h_v, get_score=True, sliding_window=self.n_local)
 
+        # In parallel stream: determine and stage global context
         with torch.cuda.stream(GLOBAL_STREAM):
             topk_blocks = self._calc_topk_blocks(local_h_q.size(-2), global_q)
+
+            # Optionally prepend contiguity neighbors
             if self.use_contiguity_buffer:
                 self._update_contiguity_buffer(local_h_q.size(-2), topk_blocks)
                 for u in range(self.batch_size):
                     if len(self.contiguity_buffer[u]) > 0:
                         topk_blocks[u] = self.contiguity_buffer[u] + topk_blocks[u]
 
+            # LRU maintenance: mark access, evict to meet token budget, then optionally nudge CPU→disk
             self.load_count += 1
             for u in range(self.batch_size):
                 tokens_in_cache = sum([self.global_blocks[u][bidx].size for bidx in self.cached_blocks[u].keys()])
@@ -1026,6 +1248,7 @@ class ContextManager:
                 if self.allow_disk_offload is True:
                     self._remove_cpu_lru_blocks(set(list(self.cached_blocks[u].keys())))
 
+                # Touch timestamps for blocks we’re going to use
                 for bidx in topk_blocks[u]:
                     self.cached_blocks[u][bidx] = self.load_count
                     if self.allow_disk_offload is not False:
@@ -1036,9 +1259,11 @@ class ContextManager:
                 local_h_q.size(-2), topk_blocks
             )
 
+        # Ensure the current stream waits for global staging
         if self.async_global_stream:
             torch.cuda.current_stream().wait_stream(GLOBAL_STREAM)
 
+        # Append global segment with complement sliding window (prevents double-count overlap)
         attn.append(
             global_h_q,
             global_h_k,
@@ -1048,6 +1273,8 @@ class ContextManager:
             sliding_window=global_sliding_window,
             complement_sliding_window=True,
         )
+
+        # Finalize attention and capture representation scores for memory update
         attn_output, repr_score = attn.get_result()
         self.exc_repr_score = repr_score[0]
 
@@ -1057,7 +1284,21 @@ class ContextManager:
         self.attn = None
         return attn_output.view((self.batch_size, self.num_heads, -1, self.dim_head))
 
+
     def _from_group_kv(self, tensor):
+        """
+        Expand grouped KV heads to match the number of Q heads.
+
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            Tensor shaped (H_kv, T, Dh) or (H, T, Dh). If already H==num_heads, returns as is.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor with shape (H, T, Dh) where H == self.num_heads.
+        """
         assert tensor.dim() == 3
         if tensor.size(0) == self.num_heads:
             return tensor
@@ -1067,23 +1308,62 @@ class ContextManager:
         tensor = tensor.expand((self.num_heads_kv, num_group, length, dim_head)).reshape((self.num_heads, length, dim_head))
         return tensor
 
+
     def get_block_k(self, k, repr_score):
+        """
+        Select the top-K key positions per head based on representation scores.
+
+        Parameters
+        ----------
+        k : torch.Tensor
+            Keys with shape (..., T, Dh); at least 2D with time on the penultimate axis.
+        repr_score : torch.Tensor
+            Representation scores with shape (..., T) matching k without Dh.
+
+        Returns
+        -------
+        (torch.Tensor, int)
+            - Gathered K entries of shape (H, repr_topk, Dh) after head expansion.
+            - The integer repr_topk actually used (min(self.repr_topk, T)).
+        """
         assert isinstance(repr_score, torch.Tensor)
         assert k.dim() >= 2
         k = self._from_group_kv(k)
         assert k.shape[:-1] == repr_score.shape
+
         repr_topk = min(self.repr_topk, repr_score.shape[-1])
         score_topk = repr_score.topk(repr_topk, dim=-1).indices
         assert score_topk.shape == (self.num_heads, repr_topk)
-        return torch.gather(k, -2, score_topk[:, :, None].expand(self.num_heads, repr_topk, self.dim_head)), repr_topk
+
+        gathered = torch.gather(k, -2, score_topk[:, :, None].expand(self.num_heads, repr_topk, self.dim_head))
+        return gathered, repr_topk
+
 
     def _add_block(self, u, remainder_st, remainder_ed, load_to_disk=False):
+        """
+        Create a new memory block from the global remainder window and register its metadata.
+
+        Parameters
+        ----------
+        u : int
+            Batch index.
+        remainder_st, remainder_ed : int
+            Start/end indices into the global remainder to form this block.
+        load_to_disk : bool
+            If True, directly offload block payload to disk instead of CPU cache.
+
+        Side Effects
+        ------------
+        - Appends a new MemoryBlock to self.global_blocks[u].
+        - Updates μK signatures (block_muK) and block representation vectors (block_repr_k).
+        - Increments self.num_global_block and self.global_length[u].
+        """
         kv = (
             self.global_remainder[0][u, :, remainder_st:remainder_ed, :],
             self.global_remainder[1][u, :, remainder_st:remainder_ed, :],
         )
 
-        # μK signature for this block (H_kv, Dh)
+        # Per-block head-mean key signature (normalized), used for optional Q–μK retrieval
         try:
             k_slice = self.global_remainder[0][u, :, remainder_st:remainder_ed, :]  # (H_kv, span, Dh)
             mu_k = k_slice.mean(dim=1)  # (H_kv, Dh)
@@ -1104,8 +1384,9 @@ class ContextManager:
 
         if self.allow_disk_offload is not False:
             bidx = len(self.global_blocks[u]) - 1
-            self.block_usage[u][bidx] = 0
+            self.block_usage[u][bidx] = 0  # initialize “last used” timestamp
 
+        # Compute block-level retrieval vector from top-k per-head positions
         global_block_repr_k, repr_topk = self.get_block_k(
             self.global_remainder[0][u, :, remainder_st:remainder_ed, :],
             self.global_remainder_repr_score[u, :, remainder_st:remainder_ed],
@@ -1118,12 +1399,37 @@ class ContextManager:
         self.num_global_block += 1
         self.global_length[u] += remainder_ed - remainder_st
 
+
     def append(self, local_q, local_k, local_v, global_q, global_k, global_v):
+        """
+        Append a new local segment and corresponding global remainder, then run retrieval+attention.
+
+        Steps
+        -----
+        1) Initialize state on first call.
+        2) Ensure CPU cache/vector offload if enabled.
+        3) Extend the rolling local KV caches with the new local segment.
+        4) Extend the global remainder (K, V, Q, and score buffers).
+        5) Call _retrieve_and_attend to run the attention pass and return output.
+
+        Parameters
+        ----------
+        local_q, local_k, local_v : torch.Tensor
+            New local segment Q/K/V with shape (B, H or H_kv, T_local, Dh).
+        global_q, global_k, global_v : torch.Tensor
+            Global segment Q/K/V aligned to the same T_local (after rotary shift inside).
+
+        Returns
+        -------
+        torch.Tensor
+            Attention output of shape (B, H, T_local, Dh).
+        """
         batch_size = local_q.size(0)
         input_length = local_q.size(-2)
         assert input_length <= self.exc_block_size
         assert batch_size == 1
 
+        # If per-head mode, expand KV heads to match Q heads
         if self.perhead:
             num_heads = local_q.size(1)
             num_heads_kv = local_v.size(1)
@@ -1141,25 +1447,29 @@ class ContextManager:
             global_k = repeat_kv(global_k)
             global_v = repeat_kv(global_v)
 
+        # Lazy init of buffers and bookkeeping
         if not self.initialized:
             self._init(local_q, local_k, local_v, global_q, global_k, global_v)
 
+        # Prepare CPU caches / vector offload when enabled
         if self.allow_disk_offload is True:
             if self.cpu_cache is None:
                 self._init_cpu_cache(local_q, local_k)
             if self.vector_offload and self.block_repr_k[0].data.device != torch.device("cpu"):
                 self._offload_vector()
 
+        # Keep global stream in sync if async staging is used
         if self.async_global_stream:
             GLOBAL_STREAM.wait_stream(torch.cuda.current_stream())
 
-        # Concat local KV cache to inputs
+        # 1) Extend rolling local KV caches
         self.local_k = torch.cat((self.local_k, local_k), dim=-2)
         self.local_v = torch.cat((self.local_v, local_v), dim=-2)
         self.kv_length = self.local_k.size(-2)
 
-        # Append global remainder
+        # 2) Extend global remainder and associated score buffers (done on the GLOBAL stream)
         with torch.cuda.stream(GLOBAL_STREAM):
+            # Apply rotary to the new global segment (offset by current n_local)
             global_q = self.position_embedding.apply_rotary_pos_emb_one_angle(global_q, self.n_local)
 
             self._global_remainder_st = 0
@@ -1171,6 +1481,7 @@ class ContextManager:
                 torch.cat((self.global_remainder[2], global_q), dim=-2),
             )
 
+            # Extend placeholder tensors for representation scores and surprisal/divide flags
             self.global_remainder_repr_score = torch.cat(
                 (
                     self.global_remainder_repr_score,
@@ -1199,6 +1510,7 @@ class ContextManager:
                 dim=-1,
             )
 
+        # 3) Run retrieval + attention
         attn_output = self._retrieve_and_attend(local_q, self.local_k, self.local_v, global_q)
 
         if self.perhead:
@@ -1206,21 +1518,51 @@ class ContextManager:
 
         return attn_output
 
+
     def update_memory(self, exc_length, exc_surprisal, surprisal_values=None):
+        """
+        After producing attention for a new local chunk, update the long-term memory.
+
+        What happens
+        ------------
+        - Accumulate representation scores for the just-processed positions.
+        - Update surprisal (or divide) indicators to decide where to cut blocks.
+        - Grow the 'init' context up to n_init tokens.
+        - Partition the global remainder into blocks by divide markers, add full or partial blocks.
+        - Advance the global remainder window and prune local KV to n_local.
+
+        Parameters
+        ----------
+        exc_length : int
+            Number of new tokens just processed.
+        exc_surprisal : torch.Tensor or torch.BoolTensor or None
+            Either per-token surprisal values (B, T_exc) or boolean divide flags.
+            If None, only representation scores are updated.
+        surprisal_values : torch.Tensor or None
+            Optional override for surprisal values (same shape as exc_surprisal float).
+
+        Side Effects
+        ------------
+        - Updates global_remainder buffers, block boundaries (global_block_divide),
+        block metadata (global_blocks, block_muK, block_repr_k), and local KV caches.
+        """
         with torch.cuda.stream(GLOBAL_STREAM):
             global_remainder_ed = self._global_remainder_ed + exc_length
             global_remainder_st = self._global_remainder_st
             global_remainder_len = global_remainder_ed - global_remainder_st
 
+            # 1) Accumulate representation scores over the processed region
             assert self.exc_repr_score.shape[:3] == (self.batch_size, self.num_heads, self.kv_length)
             self.exc_repr_score = self.exc_repr_score[:, :, -exc_length - self.n_local :]
             self.global_remainder_repr_score[:, :, global_remainder_ed - self.exc_repr_score.size(-1) : global_remainder_ed].add_(
                 self.exc_repr_score
             )
 
+            # 2) Update divide markers from surprisal or uniform sizing
             if exc_surprisal is not None:
                 if self.use_hf_acc:
                     exc_surprisal = exc_surprisal.to(self.global_remainder_surprisal.device)
+
                 if not self.uniform_blocks:
                     assert exc_surprisal.shape == (self.batch_size, exc_length)
                     if surprisal_values is None:
@@ -1234,6 +1576,7 @@ class ContextManager:
                             surprisal_values
                         )
 
+                    # Convert float surprisal → boolean divide threshold; if already bool, use directly
                     if exc_surprisal.dtype == torch.bool:
                         divide = exc_surprisal
                     else:
@@ -1244,11 +1587,13 @@ class ContextManager:
                             + torch.mean(self.global_remainder_surprisal[:, avg_st:avg_ed], dim=-1)
                         )
                 else:
+                    # Uniform block partitioning mode (debug/ablation)
                     divide = torch.zeros(exc_surprisal.shape, dtype=torch.bool)
                     divide[:, :: self.max_block_size] = True
 
                 self.global_block_divide[:, global_remainder_ed - exc_length : global_remainder_ed].copy_(divide)
 
+            # 3) Grow the init context up to n_init using the earliest part of the remainder
             if not self.init_exc and global_remainder_len > self.n_local:
                 global_k = self.global_remainder[0]
                 global_v = self.global_remainder[1]
@@ -1266,11 +1611,14 @@ class ContextManager:
                 if self.init_k.size(-2) == self.n_init:
                     self.init_exc = True
 
+            # 4) Partition the remainder into blocks and register them
             if global_remainder_len >= self.n_local + self.min_block_size:
                 ed = global_remainder_len - self.n_local
                 for u in range(self.batch_size):
                     divide = self.global_block_divide[u, global_remainder_st : global_remainder_st + ed]
                     surprising_token_idx = torch.where(divide > 0)[0]
+
+                    # Fallback: if no divides, enforce a stride at max_block_size (or a final tail)
                     if surprising_token_idx.shape[-1] == 0:
                         if divide.shape[-1] > self.max_block_size:
                             surprising_token_idx = torch.tensor(
@@ -1279,6 +1627,7 @@ class ContextManager:
                         else:
                             surprising_token_idx = torch.tensor([divide.shape[-1]], dtype=torch.int16, device=divide.device)
 
+                    # Make inclusive block edges [0, ..., len]
                     surprising_token_idx = torch.cat(
                         (
                             torch.tensor([0], device=surprising_token_idx.device),
@@ -1286,13 +1635,18 @@ class ContextManager:
                             torch.tensor([len(divide)], device=surprising_token_idx.device),
                         )
                     )
+
                     block_sizes = surprising_token_idx[1:] - surprising_token_idx[:-1]
                     mask = torch.where(block_sizes != 0)[0]
                     block_sizes = block_sizes[mask]
+
+                    # If CPU cache nearly full, directly create blocks as disk-resident
                     load_to_disk = False
                     if self.allow_disk_offload is True and len(self.cpu_cache.idle_set) == 1:
                         print("=== WARNING! ===> ONLY ONE CPU CACHE UNIT LEFT! OFFLOADING DIRECTLY TO DISK")
                         load_to_disk = True
+
+                    # Accumulate sub-blocks until reaching max_block_size; flush and continue
                     acc_b = 0
                     for i, b in enumerate(block_sizes):
                         acc_b += int(b.item())
@@ -1300,27 +1654,37 @@ class ContextManager:
                             self._add_block(u, global_remainder_st, global_remainder_st + self.max_block_size, load_to_disk=load_to_disk)
                             global_remainder_st += self.max_block_size
                             acc_b -= self.max_block_size
+
+                        # Avoid creating tiny sub-blocks below min_block_size (except at the very end)
                         if acc_b < min(self.min_block_size, divide.shape[-1]):
                             continue
+
+                        # Flush mid-run partial block if not the last one
                         if acc_b > 0 and i != len(block_sizes) - 1:
                             self._add_block(u, global_remainder_st, global_remainder_st + acc_b, load_to_disk=load_to_disk)
                             global_remainder_st += acc_b
                         acc_b = 0
 
+            # 5) Commit new remainder bounds
             self._global_remainder_ed = global_remainder_ed
             self._global_remainder_st = global_remainder_st
 
+        # Synchronize: ensure memory updates finish before next compute on current stream
         if self.async_global_stream:
             torch.cuda.current_stream().wait_stream(GLOBAL_STREAM)
 
+        # Advance the global length counter
         self.length += exc_length
 
-        # Prune local KV
+        # 6) Keep only the last n_local tokens in local KV (rolling window)
         if self.local_k.size(-2) >= self.n_local:
             self.local_k = self.local_k[:, :, -self.n_local :, :]
             self.local_v = self.local_v[:, :, -self.n_local :, :]
 
+        # Sanity: the edited index should match the new remainder tail
         assert self._global_remainder_ed == self.global_remainder[0].size(-2)
+
+        # Trim remainder buffers to drop what we’ve turned into blocks
         with torch.cuda.stream(GLOBAL_STREAM):
             self.global_remainder = (
                 self.global_remainder[0][:, :, self._global_remainder_st :, :],

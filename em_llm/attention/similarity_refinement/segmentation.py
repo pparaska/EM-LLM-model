@@ -34,7 +34,7 @@ def events_with_similarity_adjustment(
     offset: Union[int, torch.Tensor] = 0,
 ) -> List[int]:
     """
-    Refine tentative event boundaries by locally optimizing a graph similarity objective.
+    Refine event boundaries by locally optimizing a graph similarity objective.
 
     The function takes a list of initial event boundaries (indices into a token/step
     sequence) and an adjacency/similarity matrix A over those steps. For each event,
