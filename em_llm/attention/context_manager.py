@@ -646,6 +646,22 @@ class ContextManager:
         self.qk_retrieval = kwargs.get("qk_retrieval", True)
         self.qk_weight = float(kwargs.get("qk_weight", 1.0))
         self.qk_top_h = int(kwargs.get("qk_top_h", 0))
+        
+        # Initialize cross-event reasoner if enabled 
+        self.enable_cross_event_reasoning = kwargs.get("enable_cross_event_reasoning", True)
+        self.cross_event_heads = kwargs.get("cross_event_heads", 4)
+        if self.enable_cross_event_reasoning:
+            from .cross_events import CrossEventReasoner
+            # Will initialize actual reasoner after _init() is called when we have dims
+        
+        # Initialize cross-event reasoner if enabled
+        if enable_cross_event_reasoning:
+            from .cross_events import CrossEventReasoner
+            self.cross_event_reasoner = CrossEventReasoner(
+                emb_dim=dim_head * num_heads_kv if 'num_heads_kv' in locals() else num_heads,
+                num_heads=cross_event_heads,
+                summary_pool="mean"
+            )
 
     def set_live_q_heads(self, q_heads):
         """Set per-layer mean Q heads (H, Dh) for current forward."""
@@ -723,6 +739,15 @@ class ContextManager:
         self.position_embedding._update_cos_sin_tables_len(
             self.n_local + self.exc_block_size + 1, local_k.device, local_k.dim()
         )
+        
+        # Initialize cross-event reasoner now that we have dimensions
+        if self.enable_cross_event_reasoning:
+            from .cross_events import CrossEventReasoner
+            self.cross_event_reasoner = CrossEventReasoner(
+                emb_dim=dim_head * num_heads_kv,
+                num_heads=self.cross_event_heads,
+                summary_pool="mean"
+            )
 
         # Retrieved KV memory buffer
         buffer_len = self.global_context_cap + 2 * self.max_block_size
@@ -1226,15 +1251,41 @@ class ContextManager:
 
         # In parallel stream: determine and stage global context
         with torch.cuda.stream(GLOBAL_STREAM):
+            # 1. Get top-k relevant blocks
             topk_blocks = self._calc_topk_blocks(local_h_q.size(-2), global_q)
 
-            # Optionally prepend contiguity neighbors
+            # 2. Optionally prepend contiguity neighbors
             if self.use_contiguity_buffer:
                 self._update_contiguity_buffer(local_h_q.size(-2), topk_blocks)
                 for u in range(self.batch_size):
                     if len(self.contiguity_buffer[u]) > 0:
                         topk_blocks[u] = self.contiguity_buffer[u] + topk_blocks[u]
-
+                
+            # 3. Apply cross-event reasoning to reweight and reorder blocks
+            if hasattr(self, 'cross_event_reasoner'):
+                pooled_events = []
+                for u in range(self.batch_size):
+                    block_reps = []
+                    for b_idx in topk_blocks[u]:
+                        # Get block representation (using the mean of keys)
+                        block = self.global_blocks[u][b_idx]
+                        block_rep = block.get()[0].mean(dim=1)  # Average across token dimension
+                        block_reps.append(block_rep)
+                    pooled_events.append(torch.stack(block_reps))
+                
+                event_reps = torch.stack(pooled_events)
+                
+                # Apply cross-event reasoning
+                weights, scores, _ = self.cross_event_reasoner(
+                    event_reps,
+                    global_q.mean(dim=2)  # Use mean query as the current context
+                )
+                
+                # Reorder blocks based on updated importance
+                for u in range(self.batch_size):
+                    _, indices = torch.sort(weights[u], descending=True)
+                    topk_blocks[u] = [topk_blocks[u][i] for i in indices]
+            
             # LRU maintenance: mark access, evict to meet token budget, then optionally nudge CPU→disk
             self.load_count += 1
             for u in range(self.batch_size):
