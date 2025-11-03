@@ -225,17 +225,6 @@ We have successfully integrated a cross-event reasoning mechanism into the EM-LL
    - Better block reuse through pattern recognition
    - Reduced redundancy through smart fusion
 
-4. **Performance Impact**
-   ```
-   Memory Efficiency:
-   - Without CXR: O(n) blocks stored separately
-   - With CXR: O(n-f) blocks where f = fused_blocks
-   
-   Processing Time:
-   - Additional cost: O(h×n²) for n blocks, h heads
-   - Offset by: Reduced memory operations, better cache hits
-   ```
-
 ### Technical Benefits
 
 1. **Memory Efficiency**
