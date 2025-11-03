@@ -248,12 +248,7 @@ We have successfully integrated a cross-event reasoning mechanism into the EM-LL
      - Basic relationship type identification (temporal/causal)
    - Create baseline measurements with current implementation
 
-2. **Essential CXR Enhancements** (3 days)
-   - Add static thresholding for event fusion (simpler than adaptive)
-   - Implement basic confidence scoring for relationships
-   - Add simple positional bias in cross-event attention
-
-3. **Basic Testing** (2 days)
+2. **Basic Testing** (2 days)
    - Create core unit tests for new functionality
    - Test on a small subset of the dataset
    - Document initial results
@@ -261,17 +256,8 @@ We have successfully integrated a cross-event reasoning mechanism into the EM-LL
 #### Week 2: Optimization and Refinement
 
 1. **Performance Optimization and Parameter Tuning**
-   
-   a) **Cross-Event Attention Parameters**
-   - Fine-tune attention head count (current default: 4)
-   ```python
-   # Configurable parameters in CrossEventReasoner
-   num_heads: Number of attention heads (default=4)
-   - Lower -> Faster, more focused relationships
-   - Higher -> Better relationship detection, more compute
-   ```
-   
-   b) **Event Fusion Thresholds**
+    
+   a) **Event Fusion Thresholds**
    ```python
    fusion_threshold: float = 0.5  # Current default
    # Determines when events should be combined
@@ -279,44 +265,17 @@ We have successfully integrated a cross-event reasoning mechanism into the EM-LL
    # - Higher -> More selective fusion, better precision
    ```
    
-   c) **Memory and Performance Settings**
+   b) **Memory and Performance Settings**
    ```python
    summary_pool: str = "mean"  # Options: mean, max
    enable_event_fusion: bool = True
    temperature: float = 1.0  # For attention softmax
    ```
 
-2. **Focused Improvements**
-   - Implement simple relationship verification
-   - Add basic false positive filtering
-   - Fine-tune threshold values based on results
-
-3. **Documentation and Final Testing**
+2. **Documentation and Final Testing**
    - Complete essential documentation
    - Final performance testing
    - Prepare results summary
-
-### Key Focus Areas for Maximum Impact
-
-1. **Priority Features**
-   - Basic event relationship scoring
-   - Simple threshold-based fusion
-   - Position-aware attention
-   - Basic verification checks
-
-2. **Implementation Strategy**
-   - Keep implementations simple and modular
-   - Focus on core functionality first
-   - Use existing infrastructure where possible
-   - Minimize complex dependencies
-
-3. **Testing Approach**
-   - Quick iteration cycles
-   - Focus on key metrics only
-   - Use small test sets initially
-   - Gradual scaling of test coverage
-
----
 
 ## Previously Planned Improvements
 
