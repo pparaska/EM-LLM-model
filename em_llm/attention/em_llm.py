@@ -330,7 +330,7 @@ def em_llm_causal_lm_forward(
     - Surprisal refinement uses only a suffix of the stream (global remainder).
     - All tensor device transfers are best-effort; falls back gracefully if needed.
     """
-    r"""
+    """
     Args:
         labels (torch.LongTensor, optional): shape (batch_size, seq_len)
     """
