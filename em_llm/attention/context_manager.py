@@ -48,6 +48,8 @@ import psutil
 import torch
 from typing import Optional, Tuple
 from .dot_product_attention import TorchMultiStageDotProductAttention
+from .cross_events import CrossEventReasoner
+
 
 
 class CudaCache:
@@ -660,7 +662,12 @@ class ContextManager:
             self.cross_event_reasoner = CrossEventReasoner(
                 emb_dim=dim_head * num_heads_kv if 'num_heads_kv' in locals() else num_heads,
                 num_heads=cross_event_heads,
-                summary_pool="mean"
+                summary_pool="mean",
+                dropout=getattr(self, 'cross_event_dropout', 0.0),
+                temperature=getattr(self, 'cross_event_temperature', 1.0),
+                enable_event_fusion=getattr(self, 'cross_event_enable_event_fusion', True),
+                fusion_threshold=getattr(self, 'cross_event_fusion_threshold', 0.5),
+                similarity_metric=getattr(self, 'cross_event_similarity_metric', "dot_product")
             )
 
     def set_live_q_heads(self, q_heads):
@@ -746,7 +753,12 @@ class ContextManager:
             self.cross_event_reasoner = CrossEventReasoner(
                 emb_dim=dim_head * num_heads_kv,
                 num_heads=self.cross_event_heads,
-                summary_pool="mean"
+                summary_pool="mean",
+                dropout=getattr(self, 'cross_event_dropout', 0.0),
+                temperature=getattr(self, 'cross_event_temperature', 1.0),
+                enable_event_fusion=getattr(self, 'cross_event_enable_event_fusion', True),
+                fusion_threshold=getattr(self, 'cross_event_fusion_threshold', 0.5),
+                similarity_metric=getattr(self, 'cross_event_similarity_metric', "dot_product")
             )
 
         # Retrieved KV memory buffer
@@ -1199,8 +1211,7 @@ class ContextManager:
         size = 0
         for u in range(self.batch_size):
             assert len(topk_blocks[u]) == num_retrieved_blocks
-            topk_blocks[u].sort()
-
+            # Do not sort topk_blocks - preserve order of relevance 
             st = 0
             ed = 0
             for b_idx in topk_blocks[u]:
