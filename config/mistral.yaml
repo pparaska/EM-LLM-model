@@ -29,10 +29,11 @@ model:
   vector_offload_threshold: 5000    # 🔻 More aggressive offload
 
   similarity_refinement_kwargs:
-    similarity_refinement: false
+    #similarity_refinement: false
+    similarity_refinement: true
     refine_with_buffer: true
     refine_from_layer: 20
-    similarity_metric: modularity
+    similarity_metric: modularity # Options: modularity, conductance, intra_inter_sim
 
   contiguity_buffer_kwargs:
     use_contiguity_buffer: false
