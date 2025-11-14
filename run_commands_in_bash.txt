@@ -1,8 +1,14 @@
+$ source .venv/Scripts/activate
 bash scripts/run.sh -m mistral -b long-bench -d 2wikimqa -o True
 bash scripts/run.sh -m mistral -b long-bench -d gov_report -o True
 
 bash scripts/run.sh -m mistral -b infinite-bench -d math_find -o True
 
 bash scripts/run.sh -m mistral -b long-bench -d hotpotqa -o True
+
+bash scripts/run.sh -m mistral -b long-bench -d lcc -o True
+
+C:\Users\infolab01\.cache\huggingface\hub\models--mistralai--Mistral-7B-Instruct-v0.2
+
 
 
