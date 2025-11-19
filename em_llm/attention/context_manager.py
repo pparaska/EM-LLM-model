@@ -649,26 +649,15 @@ class ContextManager:
         self.qk_weight = float(kwargs.get("qk_weight", 1.0))
         self.qk_top_h = int(kwargs.get("qk_top_h", 0))
         
-        # Initialize cross-event reasoner if enabled 
+        # Cross-event reasoning configuration (will initialize reasoner in _init when dims are known)
         self.enable_cross_event_reasoning = kwargs.get("enable_cross_event_reasoning", True)
         self.cross_event_heads = kwargs.get("cross_event_heads", 4)
-        if self.enable_cross_event_reasoning:
-            from .cross_events import CrossEventReasoner
-            # Will initialize actual reasoner after _init() is called when we have dims
-        
-        # Initialize cross-event reasoner if enabled
-        if enable_cross_event_reasoning:
-            from .cross_events import CrossEventReasoner
-            self.cross_event_reasoner = CrossEventReasoner(
-                emb_dim=dim_head * num_heads_kv if 'num_heads_kv' in locals() else num_heads,
-                num_heads=cross_event_heads,
-                summary_pool="mean",
-                dropout=getattr(self, 'cross_event_dropout', 0.0),
-                temperature=getattr(self, 'cross_event_temperature', 1.0),
-                enable_event_fusion=getattr(self, 'cross_event_enable_event_fusion', True),
-                fusion_threshold=getattr(self, 'cross_event_fusion_threshold', 0.5),
-                similarity_metric=getattr(self, 'cross_event_similarity_metric', "dot_product")
-            )
+        self.cross_event_dropout = kwargs.get("cross_event_dropout", 0.0)
+        self.cross_event_temperature = kwargs.get("cross_event_temperature", 1.0)
+        self.cross_event_enable_fusion = kwargs.get("cross_event_enable_fusion", True)
+        self.cross_event_fusion_threshold = kwargs.get("cross_event_fusion_threshold", 0.5)
+        self.cross_event_similarity_metric = kwargs.get("cross_event_similarity_metric", "dot_product")
+        self.cross_event_reasoner = None  # Will be initialized in _init()
 
     def set_live_q_heads(self, q_heads):
         """Set per-layer mean Q heads (H, Dh) for current forward."""
@@ -750,16 +739,28 @@ class ContextManager:
         # Initialize cross-event reasoner now that we have dimensions
         if self.enable_cross_event_reasoning:
             from .cross_events import CrossEventReasoner
+            cross_event_emb_dim = dim_head * self.num_heads
+
             self.cross_event_reasoner = CrossEventReasoner(
-                emb_dim=dim_head * num_heads_kv,
+                emb_dim=cross_event_emb_dim,
                 num_heads=self.cross_event_heads,
                 summary_pool="mean",
-                dropout=getattr(self, 'cross_event_dropout', 0.0),
-                temperature=getattr(self, 'cross_event_temperature', 1.0),
-                enable_event_fusion=getattr(self, 'cross_event_enable_event_fusion', True),
-                fusion_threshold=getattr(self, 'cross_event_fusion_threshold', 0.5),
-                similarity_metric=getattr(self, 'cross_event_similarity_metric', "dot_product")
+                dropout=self.cross_event_dropout,
+                temperature=self.cross_event_temperature,
+                enable_event_fusion=self.cross_event_enable_fusion,
+                fusion_threshold=self.cross_event_fusion_threshold,
+                similarity_metric=self.cross_event_similarity_metric,
             )
+
+            # Run CrossEventReasoner on CPU to avoid GPU OOM
+            self.cross_event_reasoner.to("cpu")
+            self.cross_event_reasoner_device = torch.device("cpu")
+
+            if self.layer_idx == 0:
+                print(
+                    f"Initialized CrossEventReasoner with emb_dim={cross_event_emb_dim}, "
+                    f"num_heads={self.cross_event_heads}, device={local_k.device}"
+                )
 
         # Retrieved KV memory buffer
         buffer_len = self.global_context_cap + 2 * self.max_block_size
@@ -1271,31 +1272,72 @@ class ContextManager:
                 for u in range(self.batch_size):
                     if len(self.contiguity_buffer[u]) > 0:
                         topk_blocks[u] = self.contiguity_buffer[u] + topk_blocks[u]
-                
+
+
+            # --- FORCE all block representation vectors to GPU for cross-event reasoning ---
+            # if self.cross_event_reasoner is not None:
+            #     device = global_q.device
+            #     for u in range(self.batch_size):
+            #         # Move every block repr to GPU if not already
+            #         for b_idx in topk_blocks[u]:
+            #             repr_vec = self.block_repr_k[u].data[b_idx]
+            #             if repr_vec.device != device:
+            #                 self.block_repr_k[u].data[b_idx] = repr_vec.to(device, non_blocking=True)
+    
+
             # 3. Apply cross-event reasoning to reweight and reorder blocks
-            if hasattr(self, 'cross_event_reasoner'):
-                pooled_events = []
+            # The forward() method is called IMPLICITLY via PyTorch's __call__ mechanism
+            # When you do: self.cross_event_reasoner(inputs), PyTorch automatically calls forward(inputs)
+            if self.cross_event_reasoner is not None and len(topk_blocks[0]) > 0:
                 for u in range(self.batch_size):
+                    if len(topk_blocks[u]) == 0:
+                        continue
+
+                    block_indices = topk_blocks[u]
+
+                    # Use stored representation vectors: each block is one "event"
                     block_reps = []
-                    for b_idx in topk_blocks[u]:
-                        # Get block representation (using the mean of keys)
-                        block = self.global_blocks[u][b_idx]
-                        block_rep = block.get()[0].mean(dim=1)  # Average across token dimension
-                        block_reps.append(block_rep)
-                    pooled_events.append(torch.stack(block_reps))
-                
-                event_reps = torch.stack(pooled_events)
-                
-                # Apply cross-event reasoning
-                weights, scores, _ = self.cross_event_reasoner(
-                    event_reps,
-                    global_q.mean(dim=2)  # Use mean query as the current context
-                )
-                
-                # Reorder blocks based on updated importance
-                for u in range(self.batch_size):
-                    _, indices = torch.sort(weights[u], descending=True)
-                    topk_blocks[u] = [topk_blocks[u][i] for i in indices]
+                    for b_idx in block_indices:
+                        repr_vec = self.block_repr_k[u].data[b_idx]   # [E] per block, E = num_heads * dim_head
+                        block_reps.append(repr_vec)
+
+                    if len(block_reps) > 0:
+                        # [N, 1, E] where N = num_blocks, R = 1 token per event
+                        event_reps = torch.stack(block_reps, dim=0).unsqueeze(1)
+
+                        # ---- FIX: build query_rep with the SAME E = H * Dh ----
+                        # global_q[u]: [H, T, Dh] -> mean over time (T) -> [H, Dh] -> flatten -> [H*Dh]
+                        q_heads = global_q[u].mean(dim=1)   # [H, Dh]
+                        query_rep = q_heads.reshape(-1)     # [H*Dh] = 4096, matches emb_dim
+
+                        # --- Move tiny tensors to CPU for CrossEventReasoner ---
+                        event_reps_cpu = event_reps.to(self.cross_event_reasoner_device, non_blocking=False)
+                        query_rep_cpu = query_rep.to(self.cross_event_reasoner_device, non_blocking=False)
+
+                        # CPU forward pass
+                        weights_cpu, scores_cpu, _ = self.cross_event_reasoner(
+                            event_reps_cpu,
+                            query_rep_cpu
+                        )
+
+                        # Move results back to GPU
+                        weights = weights_cpu.to(global_q.device)
+                        scores = scores_cpu.to(global_q.device)
+
+                        # Debug: Log cross-event reasoning (only first few times)
+                        if self.layer_idx == 0 and self.load_count < 3:
+                            print(f"[Cross-Event] Layer {self.layer_idx}, Load {self.load_count}:")
+                            print(f"  Blocks before: {block_indices[:5]}")
+                            print(f"  Weights: {weights.cpu().tolist()[:5]}")
+
+                        # Reorder blocks by cross-event importance
+                        _, indices = torch.sort(weights, descending=True)
+                        topk_blocks[u] = [block_indices[i] for i in indices.cpu().tolist()]
+
+                        if self.layer_idx == 0 and self.load_count < 3:
+                            print(f"  Blocks after: {topk_blocks[u][:5]}")
+                            print("  Reordered successfully!")
+
             
             # LRU maintenance: mark access, evict to meet token budget, then optionally nudge CPU→disk
             self.load_count += 1
@@ -1455,8 +1497,15 @@ class ContextManager:
         )
         assert global_block_repr_k.shape == (self.num_heads, repr_topk, self.dim_head)
         global_block_repr_k = global_block_repr_k.mean(dim=-2, keepdim=False)
+        # Always keep block representation vectors on GPU for cross-event reasoning
         global_block_repr_k = global_block_repr_k.reshape(self.num_heads * self.dim_head)[None, :]
+
+        # Force GPU residency (avoid CPU→GPU cost during retrieval)
+        if self.cross_event_reasoner is not None:
+            global_block_repr_k = global_block_repr_k.to(self.global_remainder[0].device, non_blocking=True)
+
         self.block_repr_k[u].append(global_block_repr_k)
+
 
         self.num_global_block += 1
         self.global_length[u] += remainder_ed - remainder_st

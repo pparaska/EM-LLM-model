@@ -103,6 +103,10 @@ class CrossEventReasoner(nn.Module):
         base_scores: Optional[torch.Tensor] = None,   # optional, currently supported but can be commented
         per_event_token_indices=None           # reserved / unused
         ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+
+         # ---- FIX: Force FP32 for CPU MultiheadAttention ----
+        event_reps = event_reps.float()
+        query_rep = query_rep.float()
         """
         Forward supports both single-example and batched inputs.
 

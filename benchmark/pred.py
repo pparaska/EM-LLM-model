@@ -2,8 +2,8 @@
 import os
 
 # Force HuggingFace to use cached models only (no download/update checks)
-os.environ["HF_DATASETS_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# os.environ["HF_DATASETS_OFFLINE"] = "1"
+# os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 from datasets import load_from_disk, load_dataset
 import torch
