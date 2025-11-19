@@ -23,6 +23,10 @@ os.makedirs(OUTPUT_DIR_PATH, exist_ok=True)
 # Set environment variable for memory management
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+# Force HuggingFace to use cached models only (no download/update checks)
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 # Build pred.py command
 pred_cmd = [
     sys.executable, os.path.join(BASE_DIR, "benchmark", "pred.py"),
