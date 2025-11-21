@@ -19,6 +19,118 @@ import time
 import numpy as np
 from datetime import datetime
 import pprint as pp
+import re
+import string
+
+def _first_sentence(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return text
+    parts = re.split(r'(?<=[.?!])\s+', text, maxsplit=1)
+    return parts[0] if parts else text
+
+def refine_hotpot_answer(pred: str) -> str:
+    """
+    Heuristic answer post-processing tuned for HotpotQA:
+    - Take first sentence
+    - Extract the first capitalized / numeric span (entity-like)
+    """
+    sent = _first_sentence(pred)
+    tokens = sent.strip().split()
+    if not tokens:
+        return pred.strip()
+
+    # Find first token that looks like an entity (has uppercase or digit)
+    start = None
+    for i, t in enumerate(tokens):
+        if any(c.isupper() for c in t) or any(c.isdigit() for c in t):
+            start = i
+            break
+
+    # If nothing capitalized, just return first sentence
+    if start is None:
+        return sent.strip()
+
+    stop_verbs = {
+        "is", "was", "were", "are", "does", "do", "did",
+        "has", "have", "had"
+    }
+    end = start + 1
+    while end < len(tokens):
+        tok = tokens[end]
+        base = re.sub(r"\W+$", "", tok.lower())
+
+        # Stop before main verbs; keep small function words inside names
+        if base in stop_verbs:
+            break
+        if all(ch in string.punctuation for ch in tok):
+            break
+        end += 1
+
+    span = " ".join(tokens[start:end]).strip(string.punctuation + ' "')
+    return span if span else sent.strip()
+
+
+
+REMOVE_PREFIXES = [
+    r"^the answer is\s*[:,]?\s*",
+    r"^so\s*[:,]?\s*",
+    r"^thus\s*[:,]?\s*",
+    r"^therefore\s*[:,]?\s*",
+    r"^based on the context\s*[:,]?\s*",
+    r"^in conclusion\s*[:,]?\s*"
+]
+
+WORD2NUM = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10"
+}
+
+ALIASES = {
+    "usa": "united states",
+    "u.s.": "united states",
+    "u.s": "united states",
+    "uk": "united kingdom",
+    "great britain": "united kingdom",
+}
+
+def normalize_answer_general(pred: str) -> str:
+    txt = pred.strip()
+
+    # lowercase for the prefix removal
+    lower = txt.lower()
+
+    # remove leading phrases
+    for pattern in REMOVE_PREFIXES:
+        if re.match(pattern, lower):
+            lower = re.sub(pattern, "", lower)
+            break
+
+    txt = lower.strip(" \t\n\r\"'")
+
+    # replace word numbers → digits
+    for w, num in WORD2NUM.items():
+        txt = re.sub(rf"\b{w}\b", num, txt)
+
+    # alias standardization
+    t = txt.lower()
+    for alias, norm in ALIASES.items():
+        if t == alias:
+            return norm
+
+    # remove trailing punctuation
+    txt = txt.strip(".,!?\"'")
+    return txt
+
 
 
 def print_dict(d, indent=0):
@@ -476,7 +588,14 @@ def get_pred(
             )
             time2 = time.time()
 
+            #pred = post_process(output["pred"], conv_type, dataset)
             pred = post_process(output["pred"], conv_type, dataset)
+
+            if dataset.replace("__long", "") == "hotpotqa":
+                pred = refine_hotpot_answer(pred)
+
+            pred = normalize_answer_general(pred)
+
             if model_type == "em-llm" and return_block_size:
                 block_sizes = [block.size for block in searcher.past_kv[0].global_blocks[0]]
                 mean_block_size = np.mean(np.array(block_sizes))

@@ -3,6 +3,8 @@ import os
 import json
 import argparse
 import numpy as np
+import math
+
 
 def parse_json_stream(stream):
     decoder = json.JSONDecoder()
@@ -200,9 +202,15 @@ if __name__ == '__main__':
                 "score": score, 
                 "len_predictions": len_predictions
             }
-            if not (any(p is None for p in ppl)):
-                results["ppl_mean"] = np.mean(ppl)
-                results["ppl_std"] = np.std(ppl)
+
+            # Filter out None, NaN, and Inf
+            ppl_clean = [p for p in ppl if p is not None and math.isfinite(p)]
+
+            if len(ppl_clean) > 0:
+                ppl_clean = np.array(ppl_clean, dtype=float)
+                results["ppl_mean"] = float(np.mean(ppl_clean))
+                results["ppl_std"]  = float(np.std(ppl_clean))
+
             if len(block_sizes) > 0:
                 results["block_sizes_mean"] = np.mean(block_sizes)
                 results["block_sizes_std"] = np.std(block_sizes) 

@@ -656,8 +656,12 @@ class ContextManager:
         self.cross_event_temperature = kwargs.get("cross_event_temperature", 1.0)
         self.cross_event_enable_fusion = kwargs.get("cross_event_enable_fusion", True)
         self.cross_event_fusion_threshold = kwargs.get("cross_event_fusion_threshold", 0.5)
-        self.cross_event_similarity_metric = kwargs.get("cross_event_similarity_metric", "dot_product")
+        self.cross_event_similarity_metric = kwargs.get("cross_event_similarity_metric", "cosine")
+        self.cross_event_alpha_query = kwargs.get("cross_event_alpha_query", 0.7)
+
         self.cross_event_reasoner = None  # Will be initialized in _init()
+        self.cross_event_reasoner_device = torch.device("cpu")
+
 
     def set_live_q_heads(self, q_heads):
         """Set per-layer mean Q heads (H, Dh) for current forward."""
@@ -739,7 +743,7 @@ class ContextManager:
         # Initialize cross-event reasoner now that we have dimensions
         if self.enable_cross_event_reasoning:
             from .cross_events import CrossEventReasoner
-            cross_event_emb_dim = dim_head * self.num_heads
+            cross_event_emb_dim = dim_head * self.num_heads  # E = H * Dh
 
             self.cross_event_reasoner = CrossEventReasoner(
                 emb_dim=cross_event_emb_dim,
@@ -752,15 +756,16 @@ class ContextManager:
                 similarity_metric=self.cross_event_similarity_metric,
             )
 
-            # Run CrossEventReasoner on CPU to avoid GPU OOM
-            self.cross_event_reasoner.to("cpu")
+            # Keep CrossEventReasoner on CPU to avoid extra VRAM
             self.cross_event_reasoner_device = torch.device("cpu")
+            self.cross_event_reasoner.to(self.cross_event_reasoner_device)
 
             if self.layer_idx == 0:
                 print(
                     f"Initialized CrossEventReasoner with emb_dim={cross_event_emb_dim}, "
-                    f"num_heads={self.cross_event_heads}, device={local_k.device}"
+                    f"num_heads={self.cross_event_heads}, device={self.cross_event_reasoner_device}"
                 )
+
 
         # Retrieved KV memory buffer
         buffer_len = self.global_context_cap + 2 * self.max_block_size
@@ -1229,26 +1234,14 @@ class ContextManager:
         )
         return global_h_k, global_h_v, sliding_window, init_st
 
-
     def _retrieve_and_attend(self, local_q, local_k, local_v, global_q):
         """
         Core attention pass that:
         1) Pos-embeds local Q/K and appends them to the local attention buffer,
         2) Computes which global blocks to fetch,
-        3) Loads those blocks (plus init + remainder) into global K/V buffers,
-        4) Runs attention over [local | global] with complement sliding window masking.
-
-        Parameters
-        ----------
-        local_q, local_k, local_v : torch.Tensor
-            Local Q/K/V of shape (B, H or H_kv, T_local, Dh).
-        global_q : torch.Tensor
-            Global Q for retrieval scoring (same shape as local_q).
-
-        Returns
-        -------
-        torch.Tensor
-            Attention output of shape (B, H, T_local, Dh).
+        3) Optionally re-ranks blocks via CrossEventReasoner,
+        4) Loads those blocks (plus init + remainder) into global K/V buffers,
+        5) Runs attention over [local | global] with complement sliding window masking.
         """
         # Rotary/position embeddings for local segment
         local_h_q, local_h_k = self.position_embedding(local_q, local_k)
@@ -1263,7 +1256,7 @@ class ContextManager:
 
         # In parallel stream: determine and stage global context
         with torch.cuda.stream(GLOBAL_STREAM):
-            # 1. Get top-k relevant blocks
+            # 1. Get top-k relevant blocks based on retrieval vectors
             topk_blocks = self._calc_topk_blocks(local_h_q.size(-2), global_q)
 
             # 2. Optionally prepend contiguity neighbors
@@ -1273,21 +1266,7 @@ class ContextManager:
                     if len(self.contiguity_buffer[u]) > 0:
                         topk_blocks[u] = self.contiguity_buffer[u] + topk_blocks[u]
 
-
-            # --- FORCE all block representation vectors to GPU for cross-event reasoning ---
-            # if self.cross_event_reasoner is not None:
-            #     device = global_q.device
-            #     for u in range(self.batch_size):
-            #         # Move every block repr to GPU if not already
-            #         for b_idx in topk_blocks[u]:
-            #             repr_vec = self.block_repr_k[u].data[b_idx]
-            #             if repr_vec.device != device:
-            #                 self.block_repr_k[u].data[b_idx] = repr_vec.to(device, non_blocking=True)
-    
-
-            # 3. Apply cross-event reasoning to reweight and reorder blocks
-            # The forward() method is called IMPLICITLY via PyTorch's __call__ mechanism
-            # When you do: self.cross_event_reasoner(inputs), PyTorch automatically calls forward(inputs)
+            # 3. Cross-event re-ranking (CPU, deterministic)
             if self.cross_event_reasoner is not None and len(topk_blocks[0]) > 0:
                 for u in range(self.batch_size):
                     if len(topk_blocks[u]) == 0:
@@ -1295,34 +1274,34 @@ class ContextManager:
 
                     block_indices = topk_blocks[u]
 
-                    # Use stored representation vectors: each block is one "event"
+                    # Collect per-block representation vectors (each: [E])
                     block_reps = []
                     for b_idx in block_indices:
-                        repr_vec = self.block_repr_k[u].data[b_idx]   # [E] per block, E = num_heads * dim_head
+                        repr_vec = self.block_repr_k[u].data[b_idx]  # [E]
                         block_reps.append(repr_vec)
 
                     if len(block_reps) > 0:
-                        # [N, 1, E] where N = num_blocks, R = 1 token per event
+                        # Shape: [N, 1, E] where N = num_blocks, R = 1 token per "event"
                         event_reps = torch.stack(block_reps, dim=0).unsqueeze(1)
 
-                        # ---- FIX: build query_rep with the SAME E = H * Dh ----
-                        # global_q[u]: [H, T, Dh] -> mean over time (T) -> [H, Dh] -> flatten -> [H*Dh]
-                        q_heads = global_q[u].mean(dim=1)   # [H, Dh]
-                        query_rep = q_heads.reshape(-1)     # [H*Dh] = 4096, matches emb_dim
+                        # Build query representation with SAME E = H * Dh
+                        # global_q[u]: [H, T, Dh] -> mean over time -> [H, Dh] -> flatten -> [H*Dh]
+                        q_heads = global_q[u].mean(dim=1)   # [H, Dh] (mean over time)
+                        query_rep = q_heads.reshape(-1)     # [H*Dh] == emb_dim
 
-                        # --- Move tiny tensors to CPU for CrossEventReasoner ---
+                        # Move tiny tensors to CPU for CrossEventReasoner
                         event_reps_cpu = event_reps.to(self.cross_event_reasoner_device, non_blocking=False)
                         query_rep_cpu = query_rep.to(self.cross_event_reasoner_device, non_blocking=False)
 
-                        # CPU forward pass
+                        # CPU forward pass (pure functional; no parameters)
                         weights_cpu, scores_cpu, _ = self.cross_event_reasoner(
                             event_reps_cpu,
                             query_rep_cpu
                         )
 
-                        # Move results back to GPU
+                        # Move results back to GPU (only small vectors)
                         weights = weights_cpu.to(global_q.device)
-                        scores = scores_cpu.to(global_q.device)
+                        # scores = scores_cpu.to(global_q.device)  # kept for debugging if needed
 
                         # Debug: Log cross-event reasoning (only first few times)
                         if self.layer_idx == 0 and self.load_count < 3:
@@ -1338,8 +1317,7 @@ class ContextManager:
                             print(f"  Blocks after: {topk_blocks[u][:5]}")
                             print("  Reordered successfully!")
 
-            
-            # LRU maintenance: mark access, evict to meet token budget, then optionally nudge CPU→disk
+            # 4. LRU maintenance: mark access, evict to meet token budget, then offload as needed
             self.load_count += 1
             for u in range(self.batch_size):
                 tokens_in_cache = sum([self.global_blocks[u][bidx].size for bidx in self.cached_blocks[u].keys()])
