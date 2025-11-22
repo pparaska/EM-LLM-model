@@ -4,22 +4,34 @@ return_block_size: true
 logging: true
 em_splitter: surprisal
 
-max_len: 8192        # 🔻 Lowered max_len from ~2B to 32K (realistic for long context)
-chunk_size: 128       # 🔻 Reduces memory during generation
+#max_len: 8192        # 🔻 Lowered max_len from ~2B to 32K (realistic for long context)
+max_len: 16384
+max_gen: 256
+
+#chunk_size: 128       # 🔻 Reduces memory during generation
+chunk_size: 256     # 🔻 But larger chunk size can improve speed
 conv_type: mistral-inst
 extended_passkey: 1024
 
 model:
   type: em-llm
   path: mistralai/Mistral-7B-Instruct-v0.2
+  cross_event_alpha_query: 0.9
+
   min_block_size: 8
   max_block_size: 32          # 🔻 Reduce to lessen attention buffer
+  #max_block_size: 64          # 🔻 Block-level retrieval depends on block representation vectors built from repr_topk tokens.
+
   n_init: 64                  # 🔻 Lower initialization size
-  n_local: 1024               # 🔻 Halve local memory to reduce usage
-  n_mem: 512                 # 🔻 Halve retained memory
-  repr_topk: 4
+  n_local: 512               # 🔻 Halve local memory to reduce usage
+  #n_mem: 512                 # 🔻 Halve retained memory
+  n_mem: 256    
+  #repr_topk: 4
+  repr_topk: 8  #Better block representation
   max_cached_block: 128       # 🔻 Reduce from 512
-  exc_block_size: 128         # 🔻 Match to above
+  #max_cached_block: 256       # 🔻 Because we increased the, n_mem <= max_cached_block * min_block_size and n_mem, n_mem: 2048 and min_block_size: 8, this means:max_cached_block ≥ 256
+
+  exc_block_size: 512         # 🔻 Match to above
   base: 1000000
   distance_scale: 1.0
   surprisal_threshold_gamma: 1.0
@@ -36,7 +48,8 @@ model:
     similarity_metric: modularity # Options: modularity, conductance, intra_inter_sim
 
   contiguity_buffer_kwargs:
-    use_contiguity_buffer: false
+    #use_contiguity_buffer: false
+    use_contiguity_buffer: true
     contiguity_buffer_size: 0.3
 
   uniform_blocks: false

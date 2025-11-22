@@ -12,3 +12,10 @@ C:\Users\infolab01\.cache\huggingface\hub\models--mistralai--Mistral-7B-Instruct
 
 
 
+GovReport -6 
+MultiNews - 5
+TREC - 4
+TriviaQA
+SAMSum - 1
+LCC - 2 
+RepoBench-P	- 3

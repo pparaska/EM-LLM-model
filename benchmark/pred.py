@@ -555,7 +555,7 @@ def get_pred(
                 tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt", add_special_tokens=add_special_tokens).input_ids[0]
                 em_labels = None
 
-            if truncation is None:
+            if truncation is None or truncation.lower() != "suffix":
                 if len(tokenized_prompt) > max_length - max_gen:
                     if verbose:
                         print(f"Length {len(tokenized_prompt)}. Skipped.")
@@ -588,12 +588,13 @@ def get_pred(
             )
             time2 = time.time()
 
-            #pred = post_process(output["pred"], conv_type, dataset)
             pred = post_process(output["pred"], conv_type, dataset)
-
-            if dataset.replace("__long", "") == "hotpotqa":
+            
+            # HotpotQA-specific extraction
+            if dataset.startswith("hotpotqa"):
                 pred = refine_hotpot_answer(pred)
 
+            # General normalization (applies to all datasets)
             pred = normalize_answer_general(pred)
 
             if model_type == "em-llm" and return_block_size:

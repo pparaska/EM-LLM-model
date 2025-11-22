@@ -339,10 +339,9 @@ class GreedySearch:
 
         # Finalize perplexity metrics
         if self.compute_ppl:
-            # total_loss is sum of NLL; average it first
-            # total_tokens = number of predicted tokens
-            total_tokens = (input_ids.size(1) - length) if length > 0 else 1
-            avg_loss = total_loss / max(total_tokens, 1)
+            # number of predicted tokens (to average loss)
+            total_tokens = max(input_ids.size(1) - length, 1)
+            avg_loss = total_loss / total_tokens
 
             # clamp to avoid overflow in exp()
             avg_loss = torch.clamp(avg_loss, max=50.0)
@@ -351,6 +350,7 @@ class GreedySearch:
         else:
             chunk_ppl = None
             total_ppl = None
+
 
         #if self.compute_ppl:
         #    chunk_ppl = chunk_ppl

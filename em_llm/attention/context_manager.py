@@ -657,7 +657,7 @@ class ContextManager:
         self.cross_event_enable_fusion = kwargs.get("cross_event_enable_fusion", True)
         self.cross_event_fusion_threshold = kwargs.get("cross_event_fusion_threshold", 0.5)
         self.cross_event_similarity_metric = kwargs.get("cross_event_similarity_metric", "cosine")
-        self.cross_event_alpha_query = kwargs.get("cross_event_alpha_query", 0.7)
+        self.cross_event_alpha_query = kwargs.get("cross_event_alpha_query", 0.9)
 
         self.cross_event_reasoner = None  # Will be initialized in _init()
         self.cross_event_reasoner_device = torch.device("cpu")
