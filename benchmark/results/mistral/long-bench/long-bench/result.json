@@ -1,0 +1,18 @@
+{
+    "2wikimqa": {
+        "score": 22.02,
+        "len_predictions": 124,
+        "ppl_mean": 6.19942202298872,
+        "ppl_std": 1.1783464098603258,
+        "block_sizes_mean": 14.32208772055488,
+        "block_sizes_std": 6.665395809168463
+    },
+    "gov_report": {
+        "score": 31.61,
+        "len_predictions": 64,
+        "ppl_mean": 6.0323889553546906,
+        "ppl_std": 1.2883190072607567,
+        "block_sizes_mean": 14.416511877993939,
+        "block_sizes_std": 6.616810645689644
+    }
+}
