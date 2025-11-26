@@ -26,8 +26,8 @@ model:
   n_local: 512               # 🔻 Halve local memory to reduce usage
   #n_mem: 512                 # 🔻 Halve retained memory
   n_mem: 256    
-  #repr_topk: 4
-  repr_topk: 8  #Better block representation
+  repr_topk: 2
+  #repr_topk: 8  #Better block representation
   max_cached_block: 128       # 🔻 Reduce from 512
   #max_cached_block: 256       # 🔻 Because we increased the, n_mem <= max_cached_block * min_block_size and n_mem, n_mem: 2048 and min_block_size: 8, this means:max_cached_block ≥ 256
 
