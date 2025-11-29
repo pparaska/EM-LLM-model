@@ -30,5 +30,13 @@
         "ppl_std": 0.5395766637990972,
         "block_sizes_mean": 19.24103951008735,
         "block_sizes_std": 9.226652664397664
+    },
+    "narrativeqa": {
+        "score": 13.76,
+        "len_predictions": 61,
+        "ppl_mean": 9.176963860871362,
+        "ppl_std": 2.5136818181640788,
+        "block_sizes_mean": 18.653227066729176,
+        "block_sizes_std": 8.79358938560401
     }
 }
