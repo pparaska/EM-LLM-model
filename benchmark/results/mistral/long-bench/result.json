@@ -1,34 +1,10 @@
 {
-    "2wikimqa": {
-        "score": 22.02,
-        "len_predictions": 124,
-        "ppl_mean": 6.19942202298872,
-        "ppl_std": 1.1783464098603258,
-        "block_sizes_mean": 14.32208772055488,
-        "block_sizes_std": 6.665395809168463
-    },
-    "gov_report": {
-        "score": 31.61,
-        "len_predictions": 64,
-        "ppl_mean": 6.0323889553546906,
-        "ppl_std": 1.2883190072607567,
-        "block_sizes_mean": 14.416511877993939,
-        "block_sizes_std": 6.616810645689644
-    },
-    "hotpotqa": {
-        "score": 40.78,
-        "len_predictions": 141,
-        "ppl_mean": 3.2565092130791867e+21,
-        "ppl_std": 2.5058309669888296e+21,
-        "block_sizes_mean": 17.86235178902452,
-        "block_sizes_std": 8.955514761236351
-    },
-    "lcc": {
-        "score": 56.66,
-        "len_predictions": 265,
-        "ppl_mean": 2.0837911578844177,
-        "ppl_std": 0.5395766637990972,
-        "block_sizes_mean": 19.24103951008735,
-        "block_sizes_std": 9.226652664397664
+    "qmsum": {
+        "score": 20.21,
+        "len_predictions": 109,
+        "ppl_mean": 7.860902882497245,
+        "ppl_std": 1.1000718526870374,
+        "block_sizes_mean": 19.218125226441817,
+        "block_sizes_std": 9.091435166998348
     }
 }
