@@ -4,50 +4,52 @@ return_block_size: true
 logging: true
 em_splitter: surprisal
 
+#max_len: 8192        # 🔻 Lowered max_len from ~2B to 32K (realistic for long context)
 max_len: 16384
 max_gen: 256
-chunk_size: 256
+
+#chunk_size: 128       # 🔻 Reduces memory during generation
+chunk_size: 256     # 🔻 But larger chunk size can improve speed
 conv_type: mistral-inst
 extended_passkey: 1024
 
 model:
   type: em-llm
   path: mistralai/Mistral-7B-Instruct-v0.2
-
-  # --- Your Cross-Event Reasoner ---
   cross_event_alpha_query: 0.9
 
-  # --- Event Segmentation ---
-  min_block_size: 16          # ↑ bigger events help narrative understanding
-  max_block_size: 64
-  repr_topk: 4                # ↑ essential for good retrieval
+  min_block_size: 8
+  max_block_size: 32          # 🔻 Reduce to lessen attention buffer
+  #max_block_size: 64          # 🔻 Block-level retrieval depends on block representation vectors built from repr_topk tokens.
 
-  # --- Memory Configuration (VERY IMPORTANT) ---
-  n_init: 128                 # ↑ narrative needs more warmup context
-  n_local: 2048               # ↑ Large local context (critical)
-  n_mem: 1024                 # ↑ Must be >= 1024 for NarrativeQA
-  max_cached_block: 256       # ↑ more blocks stored
+  n_init: 64                  # 🔻 Lower initialization size
+  n_local: 512               # 🔻 Halve local memory to reduce usage
+  #n_mem: 512                 # 🔻 Halve retained memory
+  n_mem: 256    
+  #repr_topk: 4
+  repr_topk: 8  #Better block representation
+  max_cached_block: 128       # 🔻 Reduce from 512
+  #max_cached_block: 256       # 🔻 Because we increased the, n_mem <= max_cached_block * min_block_size and n_mem, n_mem: 2048 and min_block_size: 8, this means:max_cached_block ≥ 256
 
-  exc_block_size: 512
+  exc_block_size: 512         # 🔻 Match to above
   base: 1000000
   distance_scale: 1.0
   surprisal_threshold_gamma: 1.0
 
-  # --- Offloading ---
   min_free_cpu_memory: 50
-  disk_offload_threshold: 50000
-  vector_offload_threshold: 5000
+  disk_offload_threshold: 50000     # 🔻 Lower threshold for safer offload
+  vector_offload_threshold: 5000    # 🔻 More aggressive offload
 
-  # --- Similarity Refinement (ON improves NarrativeQA by 3–4 points) ---
   similarity_refinement_kwargs:
+    #similarity_refinement: false
     similarity_refinement: true
     refine_with_buffer: true
     refine_from_layer: 20
-    similarity_metric: modularity
+    similarity_metric: modularity # Options: modularity, conductance, intra_inter_sim
 
-  # --- Contiguity Buffer (OFF improves Narrative tasks) ---
   contiguity_buffer_kwargs:
     use_contiguity_buffer: false
+    #use_contiguity_buffer: true
     contiguity_buffer_size: 0.3
 
   uniform_blocks: false
