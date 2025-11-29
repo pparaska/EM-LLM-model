@@ -1,4 +1,13 @@
 {
+    "qmsum": {
+        "score": 20.21,
+        "len_predictions": 109,
+        "ppl_mean": 7.860902882497245,
+        "ppl_std": 1.1000718526870374,
+        "block_sizes_mean": 19.218125226441817,
+        "block_sizes_std": 9.091435166998348
+
+    },
     "2wikimqa": {
         "score": 22.02,
         "len_predictions": 124,
