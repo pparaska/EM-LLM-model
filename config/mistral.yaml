@@ -48,8 +48,8 @@ model:
     similarity_metric: modularity # Options: modularity, conductance, intra_inter_sim
 
   contiguity_buffer_kwargs:
-    #use_contiguity_buffer: false
-    use_contiguity_buffer: true
+    use_contiguity_buffer: false
+    #use_contiguity_buffer: true
     contiguity_buffer_size: 0.3
 
   uniform_blocks: false

@@ -214,8 +214,10 @@ class GreedySearch:
         if output:
             output_text = ""
 
-        total_loss = 0
+        total_loss = 0.0   # accumulate as Python float for stability
+        total_tokens = 0   # number of tokens contributing to total_loss
         chunk_ppl = []
+
 
         # i == 0 handles the initial prompt in chunks; then token-by-token
         for i in range(max_length + 1):
@@ -273,11 +275,17 @@ class GreedySearch:
                         loss = out.loss.detach().cpu() if out.loss is not None else None
                     except:
                         loss = None
+
                     if loss is not None:
+                        # loss is average NLL over (ed - st) tokens
                         ppl = torch.exp(loss).item() if self.compute_ppl else None
-                        total_loss += loss * (ed - st)
+
+                        # accumulate total NLL over all prompt tokens
+                        total_loss += float(loss) * (ed - st)
+                        total_tokens += (ed - st)
                     else:
                         ppl = None
+
                     
                     chunk_ppl.append(ppl)
 
@@ -338,18 +346,19 @@ class GreedySearch:
             sys.stdout.flush()
 
         # Finalize perplexity metrics
-        if self.compute_ppl:
-            # number of predicted tokens (to average loss)
-            total_tokens = max(input_ids.size(1) - length, 1)
-            avg_loss = total_loss / total_tokens
+        if self.compute_ppl and total_tokens > 0:
+            # average negative log-likelihood per token
+            avg_loss = total_loss / total_tokens      # Python float
 
-            # clamp to avoid overflow in exp()
-            avg_loss = torch.clamp(avg_loss, max=50.0)
+            # clamp to avoid overflow in exp (optional safety)
+            if avg_loss > 50.0:
+                avg_loss = 50.0
 
-            total_ppl = float(torch.exp(avg_loss))
+            total_ppl = float(torch.exp(torch.tensor(avg_loss)))
         else:
             chunk_ppl = None
             total_ppl = None
+
 
 
         #if self.compute_ppl:

@@ -1,4 +1,13 @@
 {
+    "qmsum": {
+        "score": 20.21,
+        "len_predictions": 109,
+        "ppl_mean": 7.860902882497245,
+        "ppl_std": 1.1000718526870374,
+        "block_sizes_mean": 19.218125226441817,
+        "block_sizes_std": 9.091435166998348
+
+    },
     "2wikimqa": {
         "score": 22.02,
         "len_predictions": 124,
@@ -16,12 +25,12 @@
         "block_sizes_std": 6.616810645689644
     },
     "hotpotqa": {
-        "score": 44.24,
-        "len_predictions": 86,
-        "ppl_mean": 1.6496790092572194e+21,
-        "ppl_std": 2.4148827982136764e+21,
-        "block_sizes_mean": 16.473075177734078,
-        "block_sizes_std": 8.513538004694619
+        "score": 40.78,
+        "len_predictions": 141,
+        "ppl_mean": 3.2565092130791867e+21,
+        "ppl_std": 2.5058309669888296e+21,
+        "block_sizes_mean": 17.86235178902452,
+        "block_sizes_std": 8.955514761236351
     },
     "lcc": {
         "score": 56.66,
@@ -30,5 +39,13 @@
         "ppl_std": 0.5395766637990972,
         "block_sizes_mean": 19.24103951008735,
         "block_sizes_std": 9.226652664397664
+    },
+    "narrativeqa": {
+        "score": 13.76,
+        "len_predictions": 61,
+        "ppl_mean": 9.176963860871362,
+        "ppl_std": 2.5136818181640788,
+        "block_sizes_mean": 18.653227066729176,
+        "block_sizes_std": 8.79358938560401
     }
 }
