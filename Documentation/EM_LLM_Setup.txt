@@ -1,0 +1,19 @@
+EM_LLM:
+1. Only works with python 3.10.11
+Setup :
+
+C:\Users\infolab01>python --version
+
+1. Python 3.10.11 is at this location:
+C:\Users\infolab01>C:\Users\infolab01\AppData\Local\Programs\Python\Python310\python.exe --version
+Python 3.10.11
+
+2. PS C:\Users\infolab01\Downloads\Master_Thesis_Poonam\EM_LLM_Implementation\EM-LLM-model> C:\Users\infolab01\AppData\Local\Programs\Python\Python310\python.exe -m venv .venv
+PS C:\Users\infolab01\Downloads\Master_Thesis_Poonam\EM_LLM_Implementation\EM-LLM-model> 
+PS C:\Users\infolab01\Downloads\Master_Thesis_Poonam\EM_LLM_Implementation\EM-LLM-model> .venv\Scripts\activate
+(.venv) PS C:\Users\infolab01\Downloads\Master_Thesis_Poonam\EM_LLM_Implementation\EM-LLM-model> python --version Python 3.10.11
+
+3.  pip install -r requirements.txt 
+4. pip install -e .
+
+5. Hugging Face token to be generated.
