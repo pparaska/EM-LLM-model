@@ -17,3 +17,31 @@ PS C:\Users\infolab01\Downloads\Master_Thesis_Poonam\EM_LLM_Implementation\EM-LL
 4. pip install -e .
 
 5. Hugging Face token to be generated.
+
+
+------------------------------------------------
+Work Environment Setup:
+
+1.	Lab Access and Initial Setup: 
+Getting started was delayed by almost a month because it took that long to gain access to the lab. During this period, administrative steps and permission issues slowed things down, which pushed back the preparation of the working environment. This experience highlighted how important it is to plan lab access well in advance when working in a shared setup.
+
+2.	Python Version Compatibility: 
+One of the first problems I ran into was a mismatch in Python versions. The EM-LLM scripts are very particular about dependencies, and they only work properly with Python 3.10.11. Using other versions led to conflicts and runtime errors. To fix this, I created a dedicated virtual environment with Python 3.10.11, which made sure all dependencies were installed correctly and kept isolated from the rest of the system.
+
+3.	Wget and Dependencies Issue: 
+Another obstacle came from the missing wget command in Windows. Since the download.sh script depends on wget to fetch datasets and models, the script failed right away. I fixed this by installing wget and updating the PATH. On top of that, some Python libraries like datasets were also missing, so I installed everything required via pip, using the requirements.txt file.
+
+4.	Memory Limitation, GPU Setup:
+The biggest challenge was GPU memory. The first attempts to run models always ended in out-of-memory errors. Troubleshooting this took nearly three weeks, which involved updating the NVIDIA GPU driver, making sure CUDA was set up correctly, and tweaking batch sizes. Eventually, I modified the scripts to process smaller datasets one at a time instead of in large batches. This workaround allowed the system to run successfully on limited resources and proved that the setup worked.
+
+5.	Hugging Face API Key & Authorization:
+While downloading models, I kept hitting 401 Unauthorized errors. The issue turned out to be that the Hugging Face API key wasn’t configured. Since some models require authentication, I generated a token on Hugging Face and added it to the environment variables. Once this was done, downloads worked without any issues.
+
+6.	Directory Path & Offload Drive Setup:
+Windows path formatting caused another problem. The scripts used a mix of backslashes and forward slashes, plus directory names with spaces (like timestamps), which resulted in errors such as NotADirectoryError. Fixed this by creating the required offload directory manually (benchmark/results/mistral/long-bench/offload_data) and adjusting the path handling for Windows. This solved the logging and checkpoint storage issues.
+
+7.	Windows Symlink & Memory Reoccurrence:
+Even after fixing the paths, memory issues showed up again. The root cause was how Hugging Face handles symlinks on Windows. Unlike Linux, Windows doesn’t manage symbolic links well, which meant Hugging Face downloaded entire models locally instead of linking them. This filled up disk space quickly and created more memory pressure. I solved it by setting up offload strategies and pointing large model data to a separate drive, which balanced the load and prevented crashes.
+
+8.	Final Verification:
+Once all these issues were sorted out, I ran benchmark scripts on smaller datasets HotPotQA from LongBench. All of them were completed successfully without major errors. This confirmed that the environment is stable and ready to handle larger datasets and more complex experiments going forward.
