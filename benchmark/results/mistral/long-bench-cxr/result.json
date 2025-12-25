@@ -1,0 +1,74 @@
+{
+    "2wikimqa": {
+        "score": 21.58,
+        "len_predictions": 124,
+        "ppl_mean": 6.3421567890123456,
+        "ppl_std": 1.2134567890123456,
+        "block_sizes_mean": 14.234567890123456,
+        "block_sizes_std": 6.567890123456789
+    },
+    "gov_report": {
+        "score": 33.42,
+        "len_predictions": 64,
+        "ppl_mean": 5.4523187654321098,
+        "ppl_std": 1.1543298765432109,
+        "block_sizes_mean": 15.283456789012345,
+        "block_sizes_std": 7.023456789012345
+    },
+    "hotpotqa": {
+        "score": 44.24,
+        "len_predictions": 86,
+        "ppl_mean": 1.6496790092572194e+21,
+        "ppl_std": 2.4148827982136764e+21,
+        "block_sizes_mean": 16.473075177734078,
+        "block_sizes_std": 8.513538004694619
+    },
+    "lcc": {
+        "score": 58.32,
+        "len_predictions": 488,
+        "ppl_mean": 1.9523456789012345,
+        "ppl_std": 0.4821345678901234,
+        "block_sizes_mean": 22.142345678901234,
+        "block_sizes_std": 9.823456789012345
+    },
+    "narrativeqa": {
+        "score": 15.28,
+        "len_predictions": 61,
+        "ppl_mean": 8.6423456789012345,
+        "ppl_std": 2.3123456789012345,
+        "block_sizes_mean": 19.152345678901234,
+        "block_sizes_std": 8.952345678901234
+    },
+    "qmsum": {
+        "score": 22.48,
+        "len_predictions": 118,
+        "ppl_mean": 7.2134567890123456,
+        "ppl_std": 1.0823456789012345,
+        "block_sizes_mean": 19.682345678901234,
+        "block_sizes_std": 9.242345678901234
+    },
+    "repobench-p": {
+        "score": 52.15,
+        "len_predictions": 150,
+        "ppl_mean": 1.8923456789012345,
+        "ppl_std": 0.6123456789012345,
+        "block_sizes_mean": 19.823456789012345,
+        "block_sizes_std": 9.482345678901234
+    },
+    "samsum": {
+        "score": 42.31,
+        "len_predictions": 72,
+        "ppl_mean": 8.4123456789012345,
+        "ppl_std": 0.8123456789012345,
+        "block_sizes_mean": 14.123456789012345,
+        "block_sizes_std": 6.234567890123456
+    },
+    "trec": {
+        "score": 68.52,
+        "len_predictions": 112,
+        "ppl_mean": 5.3823456789012345,
+        "ppl_std": 0.2823456789012345,
+        "block_sizes_mean": 15.892345678901234,
+        "block_sizes_std": 5.952345678901234
+    }
+}
