@@ -1,6 +1,5 @@
 __pycache__
 benchmark/data
 em_llm.egg-info
-*.jsonl
 *.log
 offload_data

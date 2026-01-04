@@ -27,10 +27,10 @@
     "hotpotqa": {
         "score": 40.78,
         "len_predictions": 141,
-        "ppl_mean": 3.2565092130791867e+21,
-        "ppl_std": 2.5058309669888296e+21,
-        "block_sizes_mean": 17.86235178902452,
-        "block_sizes_std": 8.955514761236351
+        "ppl_mean": 6.067356278498967,
+        "ppl_std": 1.2778500706697626,
+        "block_sizes_mean": 14.572095370253564,
+        "block_sizes_std": 6.801428951959883
     },
     "lcc": {
         "score": 56.66,
@@ -47,5 +47,29 @@
         "ppl_std": 2.5136818181640788,
         "block_sizes_mean": 18.653227066729176,
         "block_sizes_std": 8.79358938560401
+    },
+	   "trec": {
+        "score": 66.96,
+        "len_predictions": 112,
+        "ppl_mean": 5.5666157730988095,
+        "ppl_std": 0.29963619094104615,
+        "block_sizes_mean": 15.52730415129458,
+        "block_sizes_std": 5.807257845258343
+    },
+	"samsum": {
+        "score": 42.74,
+        "len_predictions": 72,
+        "ppl_mean": 8.306292712688446,
+        "ppl_std": 0.7907564352652737,
+        "block_sizes_mean": 14.14113632838753,
+        "block_sizes_std": 6.265773964484465
+    },
+    "repobench-p": {
+        "score": 48.97,
+        "len_predictions": 150,
+        "ppl_mean": 2.0538233876228333,
+        "ppl_std": 0.6699392901810663,
+        "block_sizes_mean": 19.166507968327153,
+        "block_sizes_std": 9.25436076712705
     }
 }
