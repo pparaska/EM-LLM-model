@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 class CrossEventReasoner(nn.Module):
     """
-    Lightweight, *deterministic* cross-event reasoning module.
+    Lightweight, cross-event reasoning module.
 
     Goal
     ----
